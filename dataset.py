@@ -2,7 +2,6 @@
 
 class dataset():
     
-    @staticmethod
     def load_data(partition_id: int, num_partitions):
 
     global fds
