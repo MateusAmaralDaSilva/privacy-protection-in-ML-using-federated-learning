@@ -1,27 +1,25 @@
-### criar models.py
-
-import torch
 import torch.nn as nn
-import torch.optim as optim
-from flwr_datasets import FederatedDataset
-from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
-from torch.utils.data import DataLoader, TensorDataset
-from flwr_datasets.partitioner import IidPartitioner
 
-class IncomeClassifier(nn.Module):
-    def __init__(self, input_dim: int = 14):
-        super(IncomeClassifier, self).__init__()
-        self.layer1 = nn.Linear(input_dim, 128)
-        self.layer2 = nn.Linear(128, 64)
-        self.output = nn.Linear(64, 1)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
+from dataset import LOOKBACK
+
+N_FEATURES = 12          # features per timestep (8 cyclical + snap + is_event + price_norm + sales_norm)
+INPUT_DIM = LOOKBACK * N_FEATURES  # 28 * 12 = 336
+
+
+class DemandForecaster(nn.Module):
+    """MLP that predicts next-day store sales from a 28-day feature window."""
+
+    def __init__(self, input_dim: int = INPUT_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1),
+        )
 
     def forward(self, x):
-        x = self.relu(self.layer1(x))
-        x = self.relu(self.layer2(x))
-        x = self.sigmoid(self.output(x))
-        return x
+        return self.net(x)

@@ -1,19 +1,29 @@
-"""fltabular: Flower Example on Adult Census Income Tabular Dataset."""
-
 from collections import OrderedDict
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from flwr_datasets import FederatedDataset
-from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
-from torch.utils.data import DataLoader, TensorDataset
-from flwr_datasets.partitioner import IidPartitioner
+from flwr.client import ClientApp, NumPyClient
+from flwr.common import Context, ndarrays_to_parameters
+from flwr.server import ServerApp, ServerConfig, ServerAppComponents
+from flwr.server.strategy import FedAvg
+from flwr.simulation import run_simulation
 
-fds = None  # Cache FederatedDataset
+from dataset import load_data
+from experiment import evaluate, train
+from model import DemandForecaster
+
+# Federated learning config
+NUM_PARTITIONS = 10      # one partition per Walmart store
+NUM_SERVER_ROUNDS = 10
+
+# Differential privacy config (DP-SGD)
+# Increase NOISE_MULTIPLIER for stronger privacy (at the cost of accuracy).
+CLIP_NORM = 1.0
+NOISE_MULTIPLIER = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Weight helpers
+# ---------------------------------------------------------------------------
 
 def set_weights(net, parameters):
     params_dict = zip(net.state_dict().keys(), parameters)
@@ -22,14 +32,12 @@ def set_weights(net, parameters):
 
 
 def get_weights(net):
-    ndarrays = [val.cpu().numpy() for _, val in net.state_dict().items()]
-    return ndarrays
+    return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
-"""fltabular: Flower Example on Adult Census Income Tabular Dataset."""
 
-from flwr.client import ClientApp, NumPyClient
-from flwr.common import Context
-
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 
 class FlowerClient(NumPyClient):
     def __init__(self, net, trainloader, testloader):
@@ -39,65 +47,66 @@ class FlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         set_weights(self.net, parameters)
-        train(self.net, self.trainloader)
-        return get_weights(self.net), len(self.trainloader), {}
+        train(
+            self.net,
+            self.trainloader,
+            clip_norm=CLIP_NORM,
+            noise_multiplier=NOISE_MULTIPLIER,
+            use_dp=True,
+        )
+        return get_weights(self.net), len(self.trainloader.dataset), {}
 
     def evaluate(self, parameters, config):
         set_weights(self.net, parameters)
-        loss, accuracy = evaluate(self.net, self.testloader)
-        return loss, len(self.testloader), {"accuracy": accuracy}
+        mse, mae = evaluate(self.net, self.testloader)
+        return float(mse), len(self.testloader.dataset), {"mae": float(mae)}
 
 
 def client_fn(context: Context):
     partition_id = context.node_config["partition-id"]
-
     train_loader, test_loader = load_data(
-        partition_id=partition_id, num_partitions=NUM_PARTITIONS
+        partition_id=partition_id,
+        num_partitions=NUM_PARTITIONS,
     )
-    net = IncomeClassifier()
+    net = DemandForecaster()
     return FlowerClient(net, train_loader, test_loader).to_client()
 
-"""fltabular: Flower Example on Adult Census Income Tabular Dataset."""
 
-from flwr.common import ndarrays_to_parameters
-from flwr.server import ServerApp, ServerConfig, ServerAppComponents
-from flwr.server.strategy import FedAvg
-from flwr.common import Context
-
-
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
 
 def weighted_average(metrics):
-    accuracies = [num_examples * m["accuracy"] for num_examples, m in metrics]
-    examples = [num_examples for num_examples, _ in metrics]
-
-    return {"accuracy": sum(accuracies) / sum(examples)}
+    total_samples = sum(n for n, _ in metrics)
+    weighted_mae = sum(n * m["mae"] for n, m in metrics)
+    return {"mae": weighted_mae / total_samples}
 
 
 def server_fn(context: Context) -> ServerAppComponents:
-    net = IncomeClassifier()
+    net = DemandForecaster()
     params = ndarrays_to_parameters(get_weights(net))
-
     strategy = FedAvg(
         initial_parameters=params,
         evaluate_metrics_aggregation_fn=weighted_average,
-        fraction_fit=0.2,  # 10% clients sampled each round to do fit()
-        fraction_evaluate=0.5,  # 50% clients sample each round to do evaluate()
+        fraction_fit=0.3,
+        fraction_evaluate=0.3,
     )
-    num_rounds = NUM_SERVER_ROUNDS
-    config = ServerConfig(num_rounds=num_rounds)
+    return ServerAppComponents(
+        config=ServerConfig(num_rounds=NUM_SERVER_ROUNDS),
+        strategy=strategy,
+    )
 
-    return ServerAppComponents(config=config, strategy=strategy)
 
-from flwr.simulation import run_simulation
-
-NUM_PARTITIONS = 15
-NUM_SERVER_ROUNDS = 10
+# ---------------------------------------------------------------------------
+# Simulation
+# ---------------------------------------------------------------------------
 
 server_app = ServerApp(server_fn=server_fn)
 client_app = ClientApp(client_fn=client_fn)
 
-
 hist = run_simulation(
-    server_app=server_app, client_app=client_app, num_supernodes=NUM_PARTITIONS
+    server_app=server_app,
+    client_app=client_app,
+    num_supernodes=NUM_PARTITIONS,
+    backend_config={"client_resources": {"num_cpus": 6, "num_gpus": 0}},
 )
-
