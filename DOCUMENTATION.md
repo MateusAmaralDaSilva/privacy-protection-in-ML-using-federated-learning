@@ -11,6 +11,7 @@ Dez lojas treinam seus próprios modelos localmente. Apenas os parâmetros apren
 3. [dataset.py — Pré-processamento](#3-datasetpy--pré-processamento)
 4. [XGBoost — Treinamento e Agregação](#4-xgboost--treinamento-e-agregação)
 5. [Croston — Modelo Estatístico e Agregação](#5-croston--modelo-estatístico-e-agregação)
+   5b. [Croston Ensemble — Independência Estatística](#5b-croston-ensemble--independência-estatística)
 6. [Baselines Centralizados](#6-baselines-centralizados)
 7. [XGBoost vs Croston — Comparação](#7-xgboost-vs-croston--comparação)
 8. [Privacidade — DP-SGD](#8-privacidade--dp-sgd)
@@ -34,12 +35,13 @@ O sistema segue o padrão de **federated learning horizontal**: cada cliente pos
 ### Estrutura de Arquivos
 
 ```
-dataset.py          # load_data(), load_data_torch(), load_timeseries()
-main.py             # FlowerXGBoostClient · XgbEnsembleStrategy
-croston_model.py    # CrostonForecaster
-croston_main.py     # FlowerCrostonClient · CrostonFedAvgStrategy
-centralized.py      # Baselines centralizados (teto de referência)
-experiment.py       # train() com DP-SGD (suporte a PyTorch)
+dataset.py                  # load_data(), load_data_torch(), load_timeseries()
+main.py                     # FlowerXGBoostClient · XgbEnsembleStrategy
+croston_model.py            # CrostonForecaster
+croston_main.py             # FlowerCrostonClient · CrostonFedAvgStrategy (FedAvg clássico)
+croston_ensemble_main.py    # FlowerCrostonEnsembleClient · CrostonEnsembleStrategy (sem agregação)
+centralized.py              # Baselines centralizados (teto de referência)
+experiment.py               # train() com DP-SGD (suporte a PyTorch)
 ```
 
 ---
@@ -392,6 +394,89 @@ else:
 
 ---
 
+## 5b. Croston Ensemble — Independência Estatística
+
+`croston_ensemble_main.py` substitui a agregação FedAvg por um **ensemble federado sem transferência de parâmetros no treino**. A motivação é estatística: o estado `[l, p]` de um modelo Croston é um estimador de suavização local, específico para a série daquele cliente. Fazer FedAvg com outras lojas destrói essa interpretação e pode introduzir viés.
+
+### Princípio: Separação entre Treino e Inferência
+
+| Etapa | `croston_main.py` (FedAvg) | `croston_ensemble_main.py` (Ensemble) |
+|---|---|---|
+| **Treino** | Warm-start a partir do estado global médio | Cold start sempre — treino exclusivamente local |
+| **Avaliação** | Um único modelo com estado global médio | Média ponderada das N previsões individuais |
+| **Estado global** | `[l_global, p_global]` — média ponderada | Não existe — servidor coleta, mas não agrega |
+| **Validade estatística** | Estimadores influenciados por outras lojas | Cada `[l, p]` reflete apenas a série local |
+
+### Garantia de Independência — `configure_fit`
+
+O servidor sobrescreve `configure_fit` para sempre enviar parâmetros vazios, independente do histórico acumulado:
+
+```python
+def configure_fit(self, server_round, parameters, client_manager):
+    empty = ndarrays_to_parameters([np.array([], dtype=np.float64)])
+    return super().configure_fit(server_round, empty, client_manager)
+```
+
+O cliente ignora qualquer estado recebido e sempre executa cold start:
+
+```python
+def fit(self, parameters, config):
+    model = CrostonForecaster(alpha=CROSTON_ALPHA, beta=CROSTON_BETA, variant=CROSTON_VARIANT)
+    model.fit(self.y_train)   # cold start sempre — parâmetros do servidor são ignorados
+    _, mae = model.evaluate(self.y_test)
+    return [model.get_state()], len(self.y_train), {"mae": mae}
+```
+
+### Coleta dos Estados — `CrostonEnsembleStrategy`
+
+O servidor acumula um estado por `cid` (sem fazer média):
+
+```python
+for client_proxy, fit_res in results:
+    arrays = parameters_to_ndarrays(fit_res.parameters)
+    if arrays and arrays[0].size == 2:
+        cid = client_proxy.cid
+        self._client_states[cid] = arrays[0]           # substitui — não agrega
+        self._client_errors[cid] = fit_res.metrics.get("mae", float("inf"))
+```
+
+### Pesos do Ensemble — Inverso do MAE
+
+```
+w_i = (1 / (MAE_i + ε)) / Σ_j (1 / (MAE_j + ε))
+```
+
+Modelos com menor MAE local recebem mais peso na previsão global:
+
+```python
+inv_errors = 1.0 / (errors + 1e-9)
+weights = (inv_errors / inv_errors.sum()).astype(np.float64)
+```
+
+### Transmissão para Avaliação
+
+```
+parameters[0]   = pesos do ensemble   (float64, tamanho N)
+parameters[1:]  = N estados [l, p]    (um por cliente, sorted by cid)
+```
+
+### Previsão do Ensemble (cliente)
+
+```python
+predictions = [model_i.predict() for model_i in ensemble_models]
+ensemble_pred = np.average(predictions, weights=weights)
+```
+
+### Quando Usar Cada Abordagem
+
+| Cenário | Recomendação |
+|---|---|
+| Lojas com padrões de demanda similares | `croston_main.py` (FedAvg pode se beneficiar do estado compartilhado) |
+| Lojas com padrões heterogêneos (ex: CA vs. WI) | `croston_ensemble_main.py` (cada modelo captura seu padrão local) |
+| Foco em validade estatística dos estimadores | `croston_ensemble_main.py` (treino sempre independente) |
+
+---
+
 ## 6. Baselines Centralizados
 
 `centralized.py` implementa versões centralizadas de ambos os modelos. Serve como **teto de referência**: o melhor resultado teoricamente alcançável por cada abordagem de modelagem, sem restrições de privacidade ou federação.
@@ -440,17 +525,18 @@ ensemble_forecast = sum(
 
 ## 7. XGBoost vs Croston — Comparação
 
-| Dimensão | XGBoost | Croston / SBA |
-|---|---|---|
-| Tipo de modelo | Gradient boosted trees | Exponential smoothing |
-| Input de treino | Janela 28 dias × 12 features (336 dims) | Série 1-D bruta |
-| Estado federado | Booster serializado (~centenas de KB) | 2 floats: `[l, p]` (16 bytes) |
-| Agregação servidor | Ensemble — acumula 1 booster por cid | FedAvg — média ponderada do estado |
-| Warm-start | `xgb_model=` (adiciona árvores ao booster de menor MSE) | `init_demand_level + init_interval` do estado global |
-| Custo de comunicação | Alto (serialização do booster completo) | Mínimo (16 bytes por cliente) |
-| Melhor para | Demanda contínua com padrões complexos | Demanda intermitente (itens esparsos) |
-| Previsão output | Valor normalizado por timestep | Escalar constante para o horizonte |
-| Baseline centralizado | `run_centralized_xgboost()` em `centralized.py` | `run_centralized_croston()` em `centralized.py` |
+| Dimensão | XGBoost (`main.py`) | Croston FedAvg (`croston_main.py`) | Croston Ensemble (`croston_ensemble_main.py`) |
+|---|---|---|---|
+| Tipo de modelo | Gradient boosted trees | Exponential smoothing | Exponential smoothing |
+| Input de treino | Janela 28 dias × 12 features (336 dims) | Série 1-D bruta | Série 1-D bruta |
+| Estado federado | Booster serializado (~centenas de KB) | 2 floats: `[l, p]` (16 bytes) | 2 floats: `[l, p]` por cliente |
+| Agregação servidor | Ensemble — acumula 1 booster por cid | FedAvg — média ponderada do estado | Coleta por cid — sem média |
+| Warm-start | Booster com menor MSE (acumula árvores) | Estado global médio `[l_global, p_global]` | Nenhum — cold start sempre |
+| Influência cruzada entre lojas | Sim (via warm-start) | Sim (estado médio guia o treino) | Não (treino estritamente local) |
+| Custo de comunicação | Alto (booster completo) | Mínimo (16 bytes) | Mínimo (16 bytes × N clientes) |
+| Melhor para | Demanda contínua com padrões complexos | Lojas com padrões similares | Lojas com padrões heterogêneos |
+| Previsão output | Valor normalizado por timestep | Escalar constante | Escalar ponderado do ensemble |
+| Baseline centralizado | `run_centralized_xgboost()` | `run_centralized_croston()` | `run_centralized_croston()` |
 
 ---
 
@@ -525,10 +611,16 @@ python main.py
 
 > **Nota — dependência Ray no Windows:** a simulação do Flower usa Ray como backend. Ray é experimental no Windows e pode não estar disponível. Se ocorrer o erro `KeyError: 'ray'`, o problema está no `run_simulation` do Flower — uma versão sem Ray (loop de simulação manual em `simulation.py`) está planejada.
 
-### Experimento Croston Federado
+### Experimento Croston Federado (FedAvg)
 
 ```bash
 python croston_main.py
+```
+
+### Experimento Croston Ensemble Federado (sem agregação de parâmetros)
+
+```bash
+python croston_ensemble_main.py
 ```
 
 ### Saída Esperada por Rodada (XGBoost)
@@ -544,7 +636,7 @@ Losses distribuídas: [(1, 0.42), (2, 0.39), ...]
 Métricas distribuídas: [(1, {'mae': 0.51, 'mse': 0.42}), ...]
 ```
 
-### Saída Esperada por Rodada (Croston)
+### Saída Esperada por Rodada (Croston FedAvg)
 
 ```
 [Rodada  1] Estado global agregado → demand_level=142.3021, interval=3.8740
@@ -557,6 +649,19 @@ Losses distribuídas (MSE): [(1, 18432.5), (2, 17821.3), ...]
 Métricas distribuídas (MAE): [(1, {'mae': 82.4}), ...]
 ```
 
+### Saída Esperada por Rodada (Croston Ensemble)
+
+```
+[Rodada  1] Ensemble:  3 modelos | melhor=cid node:2 (MAE=71.3412)
+[Rodada  2] Ensemble:  5 modelos | melhor=cid node:2 (MAE=71.3412)
+...
+[Rodada 10] Ensemble: 10 modelos | melhor=cid node:7 (MAE=68.9041)
+
+=== Histórico de Treinamento (Croston Ensemble Federado) ===
+Losses distribuídas (MSE): [(1, 17210.3), (2, 16854.1), ...]
+Métricas distribuídas (MAE): [(1, {'mae': 75.2}), ...]
+```
+
 ### Configurações Principais
 
 | Parâmetro | Arquivo | Padrão | Descrição |
@@ -564,9 +669,9 @@ Métricas distribuídas (MAE): [(1, {'mae': 82.4}), ...]
 | `NUM_SERVER_ROUNDS` | `main.py` / `croston_main.py` | `10` | Rodadas federadas |
 | `fraction_fit` | servidor | `0.3` | Fração de clientes por rodada de treino |
 | `LOOKBACK` | `dataset.py` | `28` | Janela deslizante em dias (XGBoost) |
-| `CROSTON_ALPHA` | `croston_main.py` | `0.1` | Suavização do nível de demanda |
-| `CROSTON_BETA` | `croston_main.py` | `0.1` | Suavização do intervalo entre demandas |
-| `CROSTON_VARIANT` | `croston_main.py` | `"sba"` | `"sba"` (recomendado) ou `"original"` |
+| `CROSTON_ALPHA` | `croston_main.py` / `croston_ensemble_main.py` | `0.1` | Suavização do nível de demanda |
+| `CROSTON_BETA` | `croston_main.py` / `croston_ensemble_main.py` | `0.1` | Suavização do intervalo entre demandas |
+| `CROSTON_VARIANT` | `croston_main.py` / `croston_ensemble_main.py` | `"sba"` | `"sba"` (recomendado) ou `"original"` |
 | `num_boost_round` | `centralized.py` | `50` | Rounds do XGBoost centralizado |
 | `noise_multiplier` | `experiment.py` | `1.0` | Intensidade do ruído diferencial (PyTorch) |
 | `clip_norm` | `experiment.py` | `1.0` | Sensitividade do gradiente (PyTorch) |

@@ -25,29 +25,39 @@ CROSTON_BETA = 0.1
 CROSTON_VARIANT = "sba"
 
 # ---------------------------------------------------------------------------
-# Estratégia: Ensemble Federado para Croston
+# Estratégia: Ensemble Federado sem Agregação de Parâmetros
 #
-# Diferença fundamental em relação ao CrostonFedAvgStrategy:
-#   • FedAvg clássico: média de [l, p] entre lojas → destrói diversidade local
-#   • Este ensemble: acumula UM estado por cliente (cid → [l, p])
+# Princípio de independência estatística:
+#   O estado [l, p] de Croston é um estimador local — específico para a série
+#   daquele cliente. Fazer FedAvg entre lojas destrói a interpretação local.
+#   Aqui o servidor NUNCA envia estado para guiar o treino. Cada cliente
+#   treina do zero (cold start) a cada rodada, preservando a validade
+#   estatística dos seus estimadores.
 #
-# Transmissão por rodada:
-#   parameters[0]   = estado warm-start (cliente com menor MAE acumulado)
-#   parameters[1]   = pesos do ensemble (float64, tamanho = nº de estados)
-#   parameters[2:]  = todos os estados [l, p] (um por cliente, sorted by cid)
+# Fluxo por rodada:
+#   Fit:      servidor → parâmetros vazios → cliente treina independentemente
+#             → cliente devolve [l, p] local + MAE local
+#   Evaluate: servidor acumula estados por cid, computa pesos por 1/MAE,
+#             envia ensemble para os clientes avaliarem
 #
-# Avaliação: previsão = média ponderada das previsões individuais.
-# Peso de cada modelo ∝ 1 / (MAE_local + ε)  → modelos melhores dominam mais.
+# Transmissão para evaluate:
+#   parameters[0]   = pesos do ensemble (float64, tamanho = nº de clientes)
+#   parameters[1:]  = estados [l, p] (um por cid, sorted by cid)
 # ---------------------------------------------------------------------------
 
 class CrostonEnsembleStrategy(FedAvg):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # cid → estado [l, p] (um por cliente, atualizado a cada participação)
+        # cid → estado [l, p] (atualizado a cada participação do cliente)
         self._client_states: dict[str, np.ndarray] = {}
-        # cid → MAE no teste local (reportado pelo cliente em fit)
+        # cid → MAE no conjunto de teste local (reportado pelo cliente)
         self._client_errors: dict[str, float] = {}
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        """Sempre envia parâmetros vazios: clientes treinam de forma independente."""
+        empty = ndarrays_to_parameters([np.array([], dtype=np.float64)])
+        return super().configure_fit(server_round, empty, client_manager)
 
     def aggregate_fit(self, server_round, results, failures):
         if not results:
@@ -63,11 +73,7 @@ class CrostonEnsembleStrategy(FedAvg):
         if not self._client_states:
             return None, {}
 
-        # Warm-start = estado do cliente com menor MAE acumulado
-        best_cid = min(self._client_errors, key=lambda c: self._client_errors[c])
-        warm_start = self._client_states[best_cid]
-
-        # Pesos inversamente proporcionais ao MAE (modelos mais precisos pesam mais)
+        # Pesos inversamente proporcionais ao MAE local de cada modelo
         cids_sorted = sorted(self._client_states.keys())
         errors = np.array(
             [self._client_errors.get(cid, 1e9) for cid in cids_sorted],
@@ -79,17 +85,18 @@ class CrostonEnsembleStrategy(FedAvg):
 
         states = [self._client_states[cid] for cid in cids_sorted]
 
-        # parameters[0] = warm-start, [1] = pesos, [2:] = todos os estados
-        params = ndarrays_to_parameters([warm_start, weights] + states)
+        # parameters[0] = pesos; parameters[1:] = estados do ensemble
+        params = ndarrays_to_parameters([weights] + states)
 
         metrics_aggregated = {}
         if self.fit_metrics_aggregation_fn:
             fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
             metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
 
+        best_cid = cids_sorted[int(np.argmin(errors))]
         print(
-            f"[Rodada {server_round:>2d}] Ensemble: {len(self._client_states):>2d} estados | "
-            f"warm-start=cid {best_cid} (MAE={self._client_errors[best_cid]:.4f})"
+            f"[Rodada {server_round:>2d}] Ensemble: {len(self._client_states):>2d} modelos | "
+            f"melhor=cid {best_cid} (MAE={self._client_errors[best_cid]:.4f})"
         )
         return params, metrics_aggregated
 
@@ -108,7 +115,7 @@ class CrostonEnsembleStrategy(FedAvg):
 
 
 # ---------------------------------------------------------------------------
-# Cliente Croston com Ensemble
+# Cliente Croston — Ensemble sem warm-start
 # ---------------------------------------------------------------------------
 
 class FlowerCrostonEnsembleClient(NumPyClient):
@@ -119,25 +126,16 @@ class FlowerCrostonEnsembleClient(NumPyClient):
 
     def fit(self, parameters, config):
         """
-        Recebe o warm-start (estado do modelo com menor MAE global) e ajusta
-        o Croston localmente. Devolve o estado atualizado + MAE local.
-        O MAE informa o servidor para seleção do próximo warm-start e cálculo
-        dos pesos do ensemble.
+        Treina o Croston exclusivamente nos dados locais (cold start sempre).
+        Ignora qualquer estado recebido do servidor para preservar a
+        independência estatística do estimador local.
+        Devolve o estado local + MAE no teste, usado pelo servidor para
+        calcular os pesos do ensemble.
         """
         model = CrostonForecaster(
             alpha=CROSTON_ALPHA, beta=CROSTON_BETA, variant=CROSTON_VARIANT
         )
-
-        # parameters[0] = warm-start [l, p] (ignoramos pesos e demais estados)
-        if parameters and len(parameters) > 0 and parameters[0].size == 2:
-            global_state = parameters[0]
-            model.fit(
-                self.y_train,
-                init_demand_level=float(global_state[0]),
-                init_interval=float(global_state[1]),
-            )
-        else:
-            model.fit(self.y_train)
+        model.fit(self.y_train)
 
         _, mae = model.evaluate(self.y_test)
         state = model.get_state()
@@ -147,32 +145,21 @@ class FlowerCrostonEnsembleClient(NumPyClient):
         """
         Avalia o ensemble federado de modelos Croston.
 
-        Layout esperado de parameters:
-            [0]  warm-start state [l, p]  — ignorado na avaliação
-            [1]  pesos do ensemble        — float64 array de tamanho N
-            [2:] N estados [l, p]         — um por cliente participante
+        Layout esperado:
+            parameters[0]   = pesos do ensemble (float64, tamanho N)
+            parameters[1:]  = N estados [l, p]
 
-        Previsão final = média ponderada das N previsões individuais.
+        Previsão = média ponderada das N previsões individuais.
         """
-        # Rodadas iniciais: sem ensemble ainda → fallback para warm-start
-        if not parameters or len(parameters) < 3:
-            if parameters and parameters[0].size == 2:
-                model = CrostonForecaster(
-                    alpha=CROSTON_ALPHA, beta=CROSTON_BETA, variant=CROSTON_VARIANT
-                )
-                model.set_state(parameters[0])
-                mse, mae = model.evaluate(self.y_test)
-                return mse, len(self.y_test), {"mae": mae}
+        if not parameters or len(parameters) < 2:
             return float("inf"), len(self.y_test), {"mae": float("inf")}
 
-        # parameters[1] = pesos (por posição, não por tamanho)
-        weights = parameters[1]
-        states = [p for p in parameters[2:] if p.size == 2]
+        weights = parameters[0]
+        states = [p for p in parameters[1:] if p.size == 2]
 
         if not states:
             return float("inf"), len(self.y_test), {"mae": float("inf")}
 
-        # Uma previsão por estado do ensemble
         predictions = []
         for state in states:
             model = CrostonForecaster(
