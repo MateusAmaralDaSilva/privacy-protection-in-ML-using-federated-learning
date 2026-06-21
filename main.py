@@ -165,13 +165,13 @@ class FlowerXGBoostClient(NumPyClient):
             xgb_model=xgb_model_param,
         )
 
-        # Avalia no teste local — informa o servidor para seleção do warm-start
-        dtest = xgb.DMatrix(self.X_test, label=self.y_test)
-        test_preds = bst.predict(dtest)
-        test_mse = float(np.mean((self.y_test - test_preds) ** 2))
+        # Avalia no TREINO para selecionar warm-start — evita vazar o conjunto de teste
+        # na decisão de seleção de modelo do servidor.
+        train_preds = bst.predict(dtrain)
+        train_mse = float(np.mean((self.y_train - train_preds) ** 2))
 
         serialized = booster_to_ndarray(bst)
-        return [serialized], len(self.X_train), {"mse": test_mse}
+        return [serialized], len(self.X_train), {"mse": train_mse}
 
     def evaluate(self, parameters, config):
         """

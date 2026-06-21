@@ -13,8 +13,8 @@ Dez lojas treinam seus próprios modelos localmente. Apenas os parâmetros apren
 5. [Croston — Modelo Estatístico e Agregação](#5-croston--modelo-estatístico-e-agregação)
    5b. [Croston Ensemble — Independência Estatística](#5b-croston-ensemble--independência-estatística)
 6. [Baselines Centralizados](#6-baselines-centralizados)
-7. [XGBoost vs Croston — Comparação](#7-xgboost-vs-croston--comparação)
-8. [Privacidade — DP-SGD](#8-privacidade--dp-sgd)
+7. [Validade do Pipeline de Avaliação](#7-validade-do-pipeline-de-avaliação)
+8. [XGBoost vs Croston — Comparação](#8-xgboost-vs-croston--comparação)
 9. [Como Executar](#9-como-executar)
 
 ---
@@ -41,7 +41,6 @@ croston_model.py            # CrostonForecaster
 croston_main.py             # FlowerCrostonClient · CrostonFedAvgStrategy (FedAvg clássico)
 croston_ensemble_main.py    # FlowerCrostonEnsembleClient · CrostonEnsembleStrategy (sem agregação)
 centralized.py              # Baselines centralizados (teto de referência)
-experiment.py               # train() com DP-SGD (suporte a PyTorch)
 ```
 
 ---
@@ -70,7 +69,7 @@ Fluxo completo da leitura dos CSVs até a métrica agregada no servidor:
 | Função | Retorno | Usada por |
 |---|---|---|
 | `load_data(partition_id, *, return_scaler=False)` | `(X_train, y_train, X_test, y_test[, scaler])` | `main.py` (federado) |
-| `load_data_torch(partition_id, num_partitions)` | `(train_loader, test_loader)` DataLoaders PyTorch | `experiment.py` e modelos PyTorch |
+| `load_data_torch(partition_id, num_partitions)` | `(train_loader, test_loader)` DataLoaders PyTorch | Modelos baseados em PyTorch |
 | `load_timeseries(partition_id, num_partitions)` | `(y_train, y_test)` como `np.ndarray` 1-D | `croston_main.py`, `croston_ensemble_main.py` |
 | `load_all_data()` | `(X_train, y_train, X_test, y_test, train_sizes, test_sizes, scalers)` | `centralized.py` (XGBoost) |
 | `load_all_timeseries()` | `(y_trains, y_tests)` — listas com uma série por loja | `centralized.py` (Croston) |
@@ -542,7 +541,63 @@ ensemble_forecast = sum(w * m.predict() for w, m in zip(weights, models))
 
 ---
 
-## 7. XGBoost vs Croston — Comparação
+## 7. Validade do Pipeline de Avaliação
+
+### Problemas identificados e correções aplicadas
+
+#### 1. IQR calculado sobre a série completa (leakage) — CORRIGIDO
+
+**Problema:** `load_timeseries()` e `load_data()` calculavam os quantis (Q1, Q3) sobre a série inteira, incluindo o período de teste. Os limites de clipping vazavam informação futura para os dados de treino.
+
+**Correção:** IQR agora é calculado exclusivamente sobre os primeiros 80% (treino) e aplicado à série completa:
+```python
+# ANTES — leakage
+q1, q3 = daily["sales"].quantile(0.25), daily["sales"].quantile(0.75)
+
+# DEPOIS — sem leakage
+train_sales_raw = daily["sales"].iloc[:train_end_raw]
+q1, q3 = train_sales_raw.quantile(0.25), train_sales_raw.quantile(0.75)
+```
+
+#### 2. Conjunto de teste usado em decisões de treino (leakage) — CORRIGIDO
+
+**Problema:** Tanto XGBoost quanto Croston ensemble reportavam métricas do **conjunto de teste** dentro de `fit()`, que o servidor usava para selecionar warm-start e calcular pesos do ensemble. O teste deve ser invisível durante o processo de treinamento.
+
+**XGBoost** (`main.py`): o MSE do teste selecionava o booster de warm-start.
+**Croston ensemble** (`croston_ensemble_main.py`): o MAE do teste ponderava o ensemble.
+**Croston centralizado** (`centralized.py`): o MAE do teste era usado para os pesos.
+
+**Correção:** todas essas métricas passam a usar o **conjunto de treino**. O `y_test` é usado exclusivamente em `evaluate()`.
+
+#### 3. Croston aplicado a demanda não-intermitente — LIMITAÇÃO CONHECIDA
+
+**Problema:** O método de Croston foi desenvolvido para séries com muitos zeros (demanda intermitente). No M5, as vendas são **somadas de todos os itens da loja** por dia:
+```python
+sales = store_rows[day_cols].sum().values  # centenas de itens somados
+```
+A soma de centenas de itens raramente é zero — a série é **contínua e sazonal**, não intermitente. O Croston não captura sazonalidade semanal nem tendência, resultando em uma previsão constante para o horizonte inteiro.
+
+**Impacto:** o Croston produz resultados inferiores ao XGBoost não por ser um modelo federado inferior, mas por ser o modelo errado para o dado agregado. Para demanda ao nível de item individual (ex: `FOODS_3_090_CA_1`), o Croston seria apropriado.
+
+**Alternativas ao Croston para demanda agregada:**
+- Simple Exponential Smoothing (SES) — sem sazonalidade
+- Holt-Winters — com tendência e sazonalidade
+- SARIMA — sazonal com componente autorregressivo
+
+#### 4. Tarefa de previsão diferente entre modelos
+
+| Aspecto | XGBoost | Croston |
+|---|---|---|
+| Tipo de previsão | Dinâmica (1 valor por dia) | Estática (constante para todo o horizonte) |
+| Número de previsões | `T_test` (um por timestep) | 1 (aplicada a todos os `T_test` dias) |
+| Captura sazonalidade | Sim (via features cíclicas) | Não (modelo estacionário) |
+| Captura tendência | Sim (via janela deslizante) | Não |
+
+Mesmo com métricas na mesma escala (bruta de vendas), o XGBoost resolve um problema estritamente mais difícil — e ainda assim obtém melhor resultado, evidenciando a inadequação do Croston para demanda agregada.
+
+---
+
+## 8. XGBoost vs Croston — Comparação
 
 | Dimensão | XGBoost (`main.py`) | Croston FedAvg (`croston_main.py`) | Croston Ensemble (`croston_ensemble_main.py`) |
 |---|---|---|---|
@@ -556,44 +611,6 @@ ensemble_forecast = sum(w * m.predict() for w, m in zip(weights, models))
 | Melhor para | Demanda contínua com padrões complexos | Lojas com padrões similares | Lojas com padrões heterogêneos |
 | Previsão output | Valor normalizado por timestep | Escalar constante | Escalar ponderado do ensemble |
 | Baseline centralizado | `run_centralized_xgboost()` | `run_centralized_croston()` | `run_centralized_croston()` |
-
----
-
-## 8. Privacidade — DP-SGD
-
-`experiment.py` implementa **Differential Privacy SGD** para modelos PyTorch. A privacidade diferencial garante que a presença ou ausência de um ponto de dado individual não possa ser inferida a partir dos gradientes compartilhados.
-
-### Mecanismo em Duas Etapas
-
-**Etapa 1 — Gradient Clipping** (limita a sensitividade)
-```python
-torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-```
-
-**Etapa 2 — Ruído Gaussiano** (mascara contribuições individuais)
-```python
-for param in model.parameters():
-    if param.grad is not None:
-        noise = torch.randn_like(param.grad)
-        noise.mul_(noise_multiplier * clip_norm / batch_size)
-        param.grad.add_(noise)
-```
-
-### Escala do Ruído
-
-```
-σ = noise_multiplier × clip_norm / batch_size
-```
-
-### Trade-off Privacidade × Acurácia
-
-| Parâmetro | Efeito na privacidade | Efeito na acurácia |
-|---|---|---|
-| `noise_multiplier` alto | ↑ privacidade | ↓ acurácia |
-| `clip_norm` baixo | ↑ privacidade | Pode desacelerar convergência |
-| `batch_size` maior | ↓ ruído relativo por amostra | ↑ acurácia (gradiente mais estável) |
-
-> **Escopo atual:** o DP-SGD está preparado para modelos PyTorch via `load_data_torch()`. Os experimentos XGBoost e Croston já têm privacidade estrutural pelo design federado (dados brutos nunca saem do cliente), mas não adicionam ruído diferencial nos parâmetros transmitidos.
 
 ---
 
@@ -692,5 +709,3 @@ Métricas distribuídas (MAE): [(1, {'mae': 75.2}), ...]
 | `CROSTON_BETA` | `croston_main.py` / `croston_ensemble_main.py` | `0.1` | Suavização do intervalo entre demandas |
 | `CROSTON_VARIANT` | `croston_main.py` / `croston_ensemble_main.py` | `"sba"` | `"sba"` (recomendado) ou `"original"` |
 | `num_boost_round` | `centralized.py` | `50` | Rounds do XGBoost centralizado |
-| `noise_multiplier` | `experiment.py` | `1.0` | Intensidade do ruído diferencial (PyTorch) |
-| `clip_norm` | `experiment.py` | `1.0` | Sensitividade do gradiente (PyTorch) |

@@ -137,9 +137,11 @@ class FlowerCrostonEnsembleClient(NumPyClient):
         )
         model.fit(self.y_train)
 
-        _, mae = model.evaluate(self.y_test)
+        # MAE no TREINO para calcular pesos do ensemble — evita vazar o conjunto
+        # de teste na ponderação do servidor. O y_test é usado apenas em evaluate().
+        _, mae_train = model.evaluate(self.y_train)
         state = model.get_state()
-        return [state], len(self.y_train), {"mae": mae}
+        return [state], len(self.y_train), {"mae": mae_train}
 
     def evaluate(self, parameters, config):
         """

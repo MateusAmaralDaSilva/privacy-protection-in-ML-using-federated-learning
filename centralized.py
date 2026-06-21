@@ -123,17 +123,19 @@ def run_centralized_croston(
         m.fit(y_train)
 
         forecast = m.predict()
-        _, local_mae = m.evaluate(y_test)
+        # Pesos calculados pelo MAE no TREINO — consistente com o cenário federado,
+        # onde fit() reporta erro de treino e y_test é reservado para evaluate().
+        _, mae_train = m.evaluate(y_train)
 
         models.append(m)
-        inv_mae_weights.append(1.0 / (local_mae + 1e-9))
+        inv_mae_weights.append(1.0 / (mae_train + 1e-9))
 
         print(
             f"  Loja {STORE_IDS[i]:>5s} → "
             f"demand_level={m.demand_level:.4f}, "
             f"interval={m.interval:.4f}, "
             f"forecast={forecast:.4f}, "
-            f"MAE={local_mae:.4f}"
+            f"MAE_treino={mae_train:.4f}"
         )
 
     # Pesos normalizados pelo inverso do MAE local (igual ao ensemble federado)

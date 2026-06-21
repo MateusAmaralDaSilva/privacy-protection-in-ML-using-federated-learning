@@ -91,13 +91,15 @@ def load_timeseries(partition_id: int, num_partitions: int = 10) -> tuple[np.nda
     # Tratamento de NaN (mesma lógica do load_data)
     sales = pd.Series(sales).ffill().bfill().fillna(0.0).values.astype(np.float32)
 
-    # Clipping IQR (mesma lógica do load_data)
-    q1 = float(np.quantile(sales, 0.25))
-    q3 = float(np.quantile(sales, 0.75))
-    iqr = q3 - q1
-    sales = np.clip(sales, q1 - 1.5 * iqr, q3 + 1.5 * iqr).astype(np.float32)
-
+    # Clipping IQR apenas sobre o conjunto de treino para evitar vazamento
     split = int(0.8 * len(sales))
+    train_sales = sales[:split]
+    q1 = float(np.quantile(train_sales, 0.25))
+    q3 = float(np.quantile(train_sales, 0.75))
+    iqr = q3 - q1
+    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    sales = np.clip(sales, lower, upper).astype(np.float32)
+
     return sales[:split], sales[split:]
 
 
@@ -175,9 +177,12 @@ def load_data(partition_id: int, num_partitions: int = 10, return_scaler: bool =
     # --- NaN treatment on raw sales ---
     daily["sales"] = daily["sales"].ffill().bfill().fillna(0.0)
 
-    # --- Outlier removal: IQR clipping on daily sales ---
+    # --- Outlier removal: IQR clipping apenas sobre o treino para evitar vazamento ---
     # Clip instead of drop to preserve temporal continuity for the sliding window.
-    q1, q3 = daily["sales"].quantile(0.25), daily["sales"].quantile(0.75)
+    n_raw = len(daily)
+    train_end_raw = int(0.8 * (n_raw - LOOKBACK)) + LOOKBACK  # alinhado com train_end_idx
+    train_sales_raw = daily["sales"].iloc[:train_end_raw]
+    q1, q3 = train_sales_raw.quantile(0.25), train_sales_raw.quantile(0.75)
     iqr = q3 - q1
     lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
     daily["sales"] = daily["sales"].clip(lower=lower, upper=upper)
@@ -286,7 +291,6 @@ def load_data(partition_id: int, num_partitions: int = 10, return_scaler: bool =
 def load_data_torch(partition_id: int, num_partitions: int = 10):
     """
     Wrapper que chama load_data() e empacota os arrays em DataLoaders PyTorch.
-    Uso: experiment.py e modelos baseados em PyTorch.
     """
     X_train, y_train, X_test, y_test = load_data(partition_id, num_partitions)
 
