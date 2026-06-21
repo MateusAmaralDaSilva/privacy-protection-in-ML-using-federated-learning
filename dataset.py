@@ -53,6 +53,36 @@ def _add_cyclical(df: pd.DataFrame, col: str, period: int) -> None:
     df[f"cos_{col}"] = np.cos(2 * np.pi * df[col] / period).astype(np.float32)
 
 
+def load_timeseries(partition_id: int, num_partitions: int = 10) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Retorna a série temporal de vendas diárias (após clipping IQR) para uma loja.
+
+    Aplica o mesmo tratamento de NaN e remoção de outliers que load_data().
+    A divisão treino/teste é temporal: primeiros 80% / últimos 20%.
+
+    Usada pelo experimento federado com o método de Croston, que opera
+    diretamente sobre a série sem engenharia de features ou janela deslizante.
+    """
+    store_id = STORE_IDS[partition_id]
+    sales_raw = _load_sales()
+
+    store_rows = sales_raw[sales_raw["store_id"] == store_id]
+    day_cols = [c for c in sales_raw.columns if c.startswith("d_")]
+    sales = store_rows[day_cols].sum().values.astype(np.float32)
+
+    # Tratamento de NaN (mesma lógica do load_data)
+    sales = pd.Series(sales).ffill().bfill().fillna(0.0).values.astype(np.float32)
+
+    # Clipping IQR (mesma lógica do load_data)
+    q1 = float(np.quantile(sales, 0.25))
+    q3 = float(np.quantile(sales, 0.75))
+    iqr = q3 - q1
+    sales = np.clip(sales, q1 - 1.5 * iqr, q3 + 1.5 * iqr).astype(np.float32)
+
+    split = int(0.8 * len(sales))
+    return sales[:split], sales[split:]
+
+
 def load_data(partition_id: int, num_partitions: int = 10):
     """
     Build train/test DataLoaders for one store partition.
@@ -184,6 +214,16 @@ def load_data(partition_id: int, num_partitions: int = 10):
     split = int(0.8 * len(X))
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
+
+    return X_train, y_train, X_test, y_test
+
+
+def load_data_torch(partition_id: int, num_partitions: int = 10):
+    """
+    Wrapper que chama load_data() e empacota os arrays em DataLoaders PyTorch.
+    Uso: experiment.py e modelos baseados em PyTorch.
+    """
+    X_train, y_train, X_test, y_test = load_data(partition_id, num_partitions)
 
     train_loader = DataLoader(
         TensorDataset(

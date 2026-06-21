@@ -1,0 +1,572 @@
+# Federated Demand Forecasting — Documentação Técnica
+
+Dez lojas treinam seus próprios modelos localmente. Apenas os parâmetros aprendidos trafegam pela rede — nunca os dados brutos de vendas. O servidor central agrega os modelos e devolve um estado global melhorado a cada rodada.
+
+---
+
+## Índice
+
+1. [Arquitetura do Sistema](#1-arquitetura-do-sistema)
+2. [Pipeline MLOps](#2-pipeline-mlops)
+3. [dataset.py — Pré-processamento](#3-datasetpy--pré-processamento)
+4. [XGBoost — Treinamento e Agregação](#4-xgboost--treinamento-e-agregação)
+5. [Croston — Modelo Estatístico e Agregação](#5-croston--modelo-estatístico-e-agregação)
+6. [Baselines Centralizados](#6-baselines-centralizados)
+7. [XGBoost vs Croston — Comparação](#7-xgboost-vs-croston--comparação)
+8. [Privacidade — DP-SGD](#8-privacidade--dp-sgd)
+9. [Como Executar](#9-como-executar)
+
+---
+
+## 1. Arquitetura do Sistema
+
+O sistema segue o padrão de **federated learning horizontal**: cada cliente possui dados de uma loja distinta com a mesma estrutura de features. O servidor nunca acessa dados brutos — apenas os parâmetros dos modelos.
+
+```
+             SERVIDOR FLOWER (Agregação Global)
+                  num_rounds=10 · gRPC
+           ↑ parâmetros locais  ↓ modelo global
+
+  CA_1  CA_2  CA_3  CA_4  TX_1  TX_2  TX_3  WI_1  WI_2  WI_3
+  (10 clientes — um por loja)
+```
+
+### Estrutura de Arquivos
+
+```
+dataset.py          # load_data(), load_data_torch(), load_timeseries()
+main.py             # FlowerXGBoostClient · XgbEnsembleStrategy
+croston_model.py    # CrostonForecaster
+croston_main.py     # FlowerCrostonClient · CrostonFedAvgStrategy
+centralized.py      # Baselines centralizados (teto de referência)
+experiment.py       # train() com DP-SGD (suporte a PyTorch)
+```
+
+---
+
+## 2. Pipeline MLOps
+
+Fluxo completo da leitura dos CSVs até a métrica agregada no servidor:
+
+| Etapa | O que acontece |
+|---|---|
+| **Entrada** | Leitura de `sales_train_evaluation.csv`, `calendar.csv`, `sell_prices.csv` com cache de módulo |
+| **Limpeza** | Forward-fill → back-fill → fill(0) para NaN; clipping por IQR para outliers |
+| **Features** | Codificação cíclica (sin/cos) de variáveis de calendário; preço médio semanal; flags SNAP e evento |
+| **Normalização** | `StandardScaler` ajustado **apenas no treino** para evitar data leakage |
+| **Split** | 80% treino / 20% teste respeitando a ordem cronológica (sem embaralhamento antes do split) |
+| **Formato** | XGBoost → janela deslizante 28 dias × 12 features = 336 dims. Croston → série bruta 1-D |
+| **Treino FL** | Cada cliente treina localmente; apenas parâmetros trafegam ao servidor |
+| **Métricas** | MSE e MAE agregados com média ponderada pelo número de amostras de cada loja |
+
+---
+
+## 3. dataset.py — Pré-processamento
+
+### Funções Públicas
+
+| Função | Retorno | Usada por |
+|---|---|---|
+| `load_data(partition_id, num_partitions)` | `(X_train, y_train, X_test, y_test)` como `np.ndarray` | `main.py`, `centralized.py` |
+| `load_data_torch(partition_id, num_partitions)` | `(train_loader, test_loader)` DataLoaders PyTorch | `experiment.py` e modelos PyTorch |
+| `load_timeseries(partition_id, num_partitions)` | `(y_train, y_test)` como `np.ndarray` 1-D | `croston_main.py`, `centralized.py` |
+
+> **Nota:** `load_data()` retorna arrays NumPy diretamente (não DataLoaders). Para usar com PyTorch, utilize `load_data_torch()`, que aplica o mesmo pré-processamento e empacota os arrays em `DataLoader`.
+
+### Cache de Módulo
+
+Os três DataFrames são lidos uma única vez e mantidos em variáveis globais do módulo. Como a simulação do Flower instancia múltiplos clientes em paralelo, sem cache cada cliente releria centenas de MB em disco a cada rodada.
+
+```python
+_sales_cache    = None   # sales_train_evaluation.csv
+_calendar_cache = None   # calendar.csv + datas parseadas
+_prices_cache   = None   # sell_prices.csv
+```
+
+### Tratamento de NaN e Outliers
+
+```python
+# NaN: preserva continuidade temporal
+daily["sales"] = daily["sales"].ffill().bfill().fillna(0.0)
+
+# Outliers: IQR clipping em vez de remoção (mantém a série contínua)
+q1, q3 = daily["sales"].quantile(0.25), daily["sales"].quantile(0.75)
+iqr = q3 - q1
+daily["sales"] = daily["sales"].clip(lower=q1 - 1.5 * iqr, upper=q3 + 1.5 * iqr)
+```
+
+### Feature Engineering
+
+O pipeline constrói **12 features por timestep**:
+
+```python
+feature_cols = [
+    "sin_wday", "cos_wday",               # dia da semana (period=7)
+    "sin_day_of_month", "cos_day_of_month", # dia do mês (period=31)
+    "sin_month", "cos_month",              # mês (period=12)
+    "sin_day_of_year", "cos_day_of_year",  # dia do ano (period=365)
+    "snap", "is_event",                    # programas/eventos
+    "price_norm",                          # preço médio normalizado
+    "sales_norm",                          # vendas normalizadas (lag)
+]
+```
+
+A codificação sin/cos é necessária porque variáveis cíclicas têm uma descontinuidade artificial se passadas como inteiros: o modelo trataria "domingo (0)" e "sábado (6)" como extremos opostos quando são adjacentes no ciclo semanal.
+
+### Normalização — Sem Data Leakage
+
+O `StandardScaler` é ajustado **exclusivamente sobre os dados de treino**:
+
+```python
+train_end_idx = int(0.8 * n_samples) + LOOKBACK
+
+# fit APENAS no treino — o scaler nunca vê o conjunto de teste
+sales_norm[:train_end_idx] = scaler.fit_transform(sales[:train_end_idx])
+sales_norm[train_end_idx:] = scaler.transform(sales[train_end_idx:])
+```
+
+Se o scaler usasse toda a série para calcular μ e σ, ele "veria" o futuro — os valores de teste influenciariam a escala dos dados de treino e inflaria artificialmente a performance dos modelos.
+
+### Janela Deslizante — `load_data()` (XGBoost)
+
+```python
+LOOKBACK = 28
+
+for i in range(LOOKBACK, len(data)):
+    X.append(data[i - LOOKBACK : i].flatten())  # [336 features]
+    y.append(targets[i])                         # venda do dia seguinte
+```
+
+Resultado: `X_train` de shape `[N, 336]`, `y_train` de shape `[N]` — ambos como `np.float32`.
+
+### Série Bruta — `load_timeseries()` (Croston)
+
+```python
+def load_timeseries(partition_id, num_partitions=10):
+    # Mesma limpeza NaN + IQR clipping que load_data()
+    split = int(0.8 * len(sales))
+    return sales[:split], sales[split:]  # (y_train, y_test) como np.ndarray
+```
+
+O Croston opera diretamente sobre a série 1-D, sem janela deslizante e sem normalização.
+
+### DataLoaders PyTorch — `load_data_torch()`
+
+```python
+def load_data_torch(partition_id, num_partitions=10):
+    X_train, y_train, X_test, y_test = load_data(partition_id, num_partitions)
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train).unsqueeze(1)),
+        batch_size=32, shuffle=True,
+    )
+    test_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test).unsqueeze(1)),
+        batch_size=32, shuffle=False,
+    )
+    return train_loader, test_loader
+```
+
+---
+
+## 4. XGBoost — Treinamento e Agregação
+
+### Hiperparâmetros
+
+```python
+XGB_PARAMS = {
+    "objective":        "reg:squarederror",  # minimiza MSE
+    "eval_metric":      "rmse",
+    "max_depth":        6,                   # profundidade das árvores
+    "learning_rate":    0.1,
+    "subsample":        0.8,                 # 80% das linhas por árvore
+    "colsample_bytree": 0.8,                 # 80% das features por árvore
+}
+```
+
+### Ciclo de Treino por Rodada Federada
+
+**1. Recebe o modelo global**
+
+O cliente desserializa o array `uint8` recebido do servidor em um `xgb.Booster`. Na rodada 1, o array está vazio — o modelo começa do zero.
+
+**2. Treina com warm-start (5 rounds locais)**
+
+```python
+bst = xgb.train(
+    XGB_PARAMS,
+    dtrain,
+    num_boost_round=5,
+    xgb_model=xgb_model_param,  # adiciona 5 árvores ao booster recebido
+)
+```
+
+O parâmetro `xgb_model` faz o warm-start: as 5 novas árvores são adicionadas sobre o ensemble recebido, sem recriar as anteriores.
+
+**3. Avalia localmente e reporta MSE**
+
+```python
+dtest = xgb.DMatrix(self.X_test, label=self.y_test)
+test_preds = bst.predict(dtest)
+test_mse = float(np.mean((self.y_test - test_preds) ** 2))
+
+return [serialized], len(self.X_train), {"mse": test_mse}
+```
+
+O MSE local é enviado junto com o booster para que o servidor possa selecionar o melhor warm-start na próxima rodada.
+
+**4. Serializa e envia**
+
+```python
+def booster_to_ndarray(bst):
+    raw = bst.save_raw(raw_format="ubj")
+    return np.frombuffer(raw, dtype=np.uint8).copy()  # writeable + C-contiguous
+```
+
+O `.copy()` é necessário porque o Flower rejeita arrays não-writeable internamente.
+
+### Agregação — `XgbEnsembleStrategy`
+
+A estratégia combina **ensemble federado** com **warm-start pelo melhor modelo**:
+
+#### Estrutura de Dados do Servidor
+
+```python
+class XgbEnsembleStrategy(FedAvg):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # cid → booster serializado (uma entrada por cliente, sem cópias antigas)
+        self._client_boosters: dict[str, np.ndarray] = {}
+        # cid → MSE no teste local (usado para selecionar o warm-start)
+        self._client_errors: dict[str, float] = {}
+```
+
+O dicionário keyed por `cid` garante que cada cliente tenha exatamente uma entrada — quando o mesmo cliente participa em rodadas diferentes, o valor é sobrescrito em vez de acumular cópias antigas.
+
+#### `aggregate_fit` — Acumula ensemble e escolhe warm-start
+
+```python
+def aggregate_fit(self, server_round, results, failures):
+    for client_proxy, fit_res in results:
+        arrays = parameters_to_ndarrays(fit_res.parameters)
+        if arrays and arrays[0].size > 0:
+            cid = client_proxy.cid
+            self._client_boosters[cid] = arrays[0]          # substitui a cópia anterior
+            self._client_errors[cid] = fit_res.metrics.get("mse", float("inf"))
+
+    # Warm-start: o booster com menor MSE acumulado entre todos os clientes
+    best_cid   = min(self._client_errors, key=lambda c: self._client_errors[c])
+    warm_start = self._client_boosters[best_cid]
+    others     = [self._client_boosters[cid]
+                  for cid in sorted(self._client_boosters.keys())
+                  if cid != best_cid]
+
+    # parameters[0] = melhor booster (warm-start); parameters[1:] = ensemble completo
+    parameters_aggregated = ndarrays_to_parameters([warm_start] + others)
+    return parameters_aggregated, metrics_aggregated
+```
+
+#### `evaluate` (cliente) — Ensemble mean
+
+```python
+def evaluate(self, parameters, config):
+    valid = [p for p in parameters if p.size > 0]
+    boosters = [ndarray_to_booster(p) for p in valid]
+    dtest = xgb.DMatrix(self.X_test, label=self.y_test)
+
+    # Média simples entre as previsões de todos os boosters acumulados
+    all_preds = np.stack([bst.predict(dtest) for bst in boosters], axis=0)
+    ensemble_preds = all_preds.mean(axis=0)
+
+    mse = float(np.mean((self.y_test - ensemble_preds) ** 2))
+    mae = float(np.mean(np.abs(self.y_test - ensemble_preds)))
+    return mse, len(self.X_test), {"mae": mae}
+```
+
+#### Formato dos parâmetros transmitidos
+
+| Posição | Conteúdo | Usado em |
+|---|---|---|
+| `parameters[0]` | Booster com menor MSE (warm-start) | `fit()` — ponto de partida do próximo treino |
+| `parameters[1:]` | Demais boosters do ensemble | `evaluate()` — membros adicionais do ensemble |
+
+> **Por que não fazer média dos boosters?** Boosters XGBoost não podem ser somados aritmeticamente — cada árvore é uma estrutura condicional, não um vetor de pesos. A estratégia de ensemble trata cada booster como um membro independente e combina suas previsões por média simples.
+
+---
+
+## 5. Croston — Modelo Estatístico e Agregação
+
+### Por que Croston?
+
+O método de Croston foi desenvolvido para **demanda intermitente**: séries com muitos zeros intercalados por valores positivos esparsos. Modelos como XGBoost tratam os zeros como parte da tendência geral; o Croston os separa matematicamente.
+
+### Decomposição da Série
+
+O algoritmo suaviza dois componentes de forma independente, atualizando **apenas nos timesteps com demanda positiva**:
+
+```
+l_t = α · z_t + (1 − α) · l_{t−1}    # nível da demanda (tamanho)
+p_t = β · q_t + (1 − β) · p_{t−1}    # intervalo entre demandas
+```
+
+Onde `z_t` é o tamanho da demanda não-nula e `q_t` é o intervalo em períodos desde a última ocorrência.
+
+### Previsão — Variante SBA (implementada)
+
+A previsão original de Croston é viesada para cima. A variante **Syntetos-Boylan (SBA)** corrige esse viés:
+
+```
+Croston Original:  F̂       = l_T / p_T
+SBA (implementado): F̂_SBA  = (1 − β/2) · l_T / p_T
+```
+
+### Implementação Python
+
+```python
+for idx in non_zero_idx:
+    q = float(idx - prev_pos)              # intervalo desde última demanda
+    l = alpha * y[idx] + (1 - alpha) * l   # atualiza nível
+    p = beta  * q     + (1 - beta)  * p    # atualiza intervalo
+    prev_pos = idx
+
+# Previsão SBA
+forecast = (1 - beta / 2) * l / p
+```
+
+### Estado Federado
+
+O estado do Croston são apenas **2 scalars**: `[demand_level, interval]`. Isso resulta em custo de comunicação mínimo — 16 bytes por cliente por rodada.
+
+```python
+def get_state(self) -> np.ndarray:
+    return np.array([self.demand_level, self.interval], dtype=np.float64)
+
+def set_state(self, state: np.ndarray) -> None:
+    self.demand_level = float(state[0])
+    self.interval = float(state[1])
+    self.fitted = True
+```
+
+### Agregação — `CrostonFedAvgStrategy`
+
+O servidor aplica **FedAvg sobre o estado**, usando média ponderada pelo número de amostras:
+
+```
+l_global = Σ (n_i · l_i) / Σ n_i
+p_global = Σ (n_i · p_i) / Σ n_i
+```
+
+```python
+def aggregate_fit(self, server_round, results, failures):
+    total_samples = sum(res.num_examples for _, res in results)
+    aggregated = np.zeros(2, dtype=np.float64)
+
+    for _, fit_res in results:
+        arrays = parameters_to_ndarrays(fit_res.parameters)
+        if arrays and arrays[0].size == 2:
+            aggregated += fit_res.num_examples * arrays[0]
+
+    aggregated /= total_samples
+    return ndarrays_to_parameters([aggregated]), {}
+```
+
+> **Limitação da abordagem atual:** a média dos parâmetros `[l, p]` entre lojas não tem interpretação estatística clara — o nível de demanda e o intervalo são estados de suavização local, específicos para a série de cada loja. Uma alternativa mais rigorosa é o **ensemble federado**: o servidor acumula um modelo por cliente e a previsão final é a média ponderada das previsões individuais (análogo ao que `XgbEnsembleStrategy` faz com os boosters).
+
+### Warm-start Federado
+
+| Rodada | Estado recebido | Comportamento do cliente |
+|---|---|---|
+| **1** | Array vazio | Cold start: `l₀ = y[first_nonzero]`, `p₀ = first_nonzero + 1` |
+| **2+** | `[l_global, p_global]` | Warm-start: suavização parte do estado global agregado |
+
+```python
+if parameters and len(parameters) > 0 and parameters[0].size == 2:
+    global_state = parameters[0]
+    model.fit(
+        self.y_train,
+        init_demand_level=float(global_state[0]),
+        init_interval=float(global_state[1]),
+    )
+else:
+    model.fit(self.y_train)  # rodada 1 — cold start
+```
+
+---
+
+## 6. Baselines Centralizados
+
+`centralized.py` implementa versões centralizadas de ambos os modelos. Serve como **teto de referência**: o melhor resultado teoricamente alcançável por cada abordagem de modelagem, sem restrições de privacidade ou federação.
+
+```bash
+python centralized.py   # executa os dois baselines e imprime o resumo
+```
+
+### XGBoost Centralizado — `run_centralized_xgboost()`
+
+Todos os dados de treino das 10 lojas são **concatenados** e um único modelo é treinado com 50 rounds. O modelo aprende padrões cross-loja — algo impossível no cenário federado, onde cada cliente só vê seus próprios dados.
+
+```python
+X_all_train = np.concatenate(X_trains, axis=0)   # dados de todas as lojas
+y_all_train = np.concatenate(y_trains, axis=0)
+
+bst = xgb.train(XGB_PARAMS, dtrain, num_boost_round=50)
+
+# Métricas globais + por loja (para comparação direta com o federado)
+```
+
+**Por que é o teto?** O modelo centralizado tem acesso simultâneo a todas as lojas e usa 50 rounds (vs. 5 locais no federado), capturando padrões que nenhum cliente federated individual consegue observar.
+
+### Croston Centralizado — `run_centralized_croston()`
+
+Cada loja tem seu próprio modelo Croston treinado com acesso irrestrito aos seus dados. O ensemble é formado por **todos os 10 modelos simultaneamente** — sem a limitação de `fraction_fit` do cenário federado.
+
+```python
+# Um modelo por loja, com acesso a todos os dados locais
+for i in range(NUM_PARTITIONS):
+    m = CrostonForecaster(alpha=alpha, beta=beta, variant=variant)
+    m.fit(y_train)
+    models.append(m)
+    weights.append(float(len(y_train)))
+
+# Ensemble: média ponderada pelo tamanho de cada série de treino
+ensemble_forecast = sum(
+    (w / total_weight) * m.predict()
+    for m, w in zip(models, weights)
+)
+```
+
+**Relação com o federado:** após rodadas suficientes para todos os clientes participarem ao menos uma vez, o ensemble federado converge para este resultado — os dados locais não mudam entre rodadas. A diferença na prática vem de `fraction_fit < 1.0` e da influência do warm-start global no estado de suavização.
+
+---
+
+## 7. XGBoost vs Croston — Comparação
+
+| Dimensão | XGBoost | Croston / SBA |
+|---|---|---|
+| Tipo de modelo | Gradient boosted trees | Exponential smoothing |
+| Input de treino | Janela 28 dias × 12 features (336 dims) | Série 1-D bruta |
+| Estado federado | Booster serializado (~centenas de KB) | 2 floats: `[l, p]` (16 bytes) |
+| Agregação servidor | Ensemble — acumula 1 booster por cid | FedAvg — média ponderada do estado |
+| Warm-start | `xgb_model=` (adiciona árvores ao booster de menor MSE) | `init_demand_level + init_interval` do estado global |
+| Custo de comunicação | Alto (serialização do booster completo) | Mínimo (16 bytes por cliente) |
+| Melhor para | Demanda contínua com padrões complexos | Demanda intermitente (itens esparsos) |
+| Previsão output | Valor normalizado por timestep | Escalar constante para o horizonte |
+| Baseline centralizado | `run_centralized_xgboost()` em `centralized.py` | `run_centralized_croston()` em `centralized.py` |
+
+---
+
+## 8. Privacidade — DP-SGD
+
+`experiment.py` implementa **Differential Privacy SGD** para modelos PyTorch. A privacidade diferencial garante que a presença ou ausência de um ponto de dado individual não possa ser inferida a partir dos gradientes compartilhados.
+
+### Mecanismo em Duas Etapas
+
+**Etapa 1 — Gradient Clipping** (limita a sensitividade)
+```python
+torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+```
+
+**Etapa 2 — Ruído Gaussiano** (mascara contribuições individuais)
+```python
+for param in model.parameters():
+    if param.grad is not None:
+        noise = torch.randn_like(param.grad)
+        noise.mul_(noise_multiplier * clip_norm / batch_size)
+        param.grad.add_(noise)
+```
+
+### Escala do Ruído
+
+```
+σ = noise_multiplier × clip_norm / batch_size
+```
+
+### Trade-off Privacidade × Acurácia
+
+| Parâmetro | Efeito na privacidade | Efeito na acurácia |
+|---|---|---|
+| `noise_multiplier` alto | ↑ privacidade | ↓ acurácia |
+| `clip_norm` baixo | ↑ privacidade | Pode desacelerar convergência |
+| `batch_size` maior | ↓ ruído relativo por amostra | ↑ acurácia (gradiente mais estável) |
+
+> **Escopo atual:** o DP-SGD está preparado para modelos PyTorch via `load_data_torch()`. Os experimentos XGBoost e Croston já têm privacidade estrutural pelo design federado (dados brutos nunca saem do cliente), mas não adicionam ruído diferencial nos parâmetros transmitidos.
+
+---
+
+## 9. Como Executar
+
+### Pré-requisitos
+
+```
+data/
+├── sales_train_evaluation.csv
+├── calendar.csv
+└── sell_prices.csv
+```
+
+### Instalar Dependências
+
+```bash
+pip install -r requirements.txt
+```
+
+### Baselines Centralizados (referência)
+
+```bash
+python centralized.py
+```
+
+Executa `run_centralized_xgboost()` e `run_centralized_croston()` em sequência e imprime MSE/MAE global e por loja para cada modelo.
+
+### Experimento XGBoost Federado
+
+```bash
+python main.py
+```
+
+> **Nota — dependência Ray no Windows:** a simulação do Flower usa Ray como backend. Ray é experimental no Windows e pode não estar disponível. Se ocorrer o erro `KeyError: 'ray'`, o problema está no `run_simulation` do Flower — uma versão sem Ray (loop de simulação manual em `simulation.py`) está planejada.
+
+### Experimento Croston Federado
+
+```bash
+python croston_main.py
+```
+
+### Saída Esperada por Rodada (XGBoost)
+
+```
+[Rodada  1] Ensemble:  3 boosters | warm-start=cid node:0 (MSE=0.423817)
+[Rodada  2] Ensemble:  5 boosters | warm-start=cid node:2 (MSE=0.391042)
+...
+[Rodada 10] Ensemble: 10 boosters | warm-start=cid node:7 (MSE=0.318654)
+
+=== Histórico de Treinamento ===
+Losses distribuídas: [(1, 0.42), (2, 0.39), ...]
+Métricas distribuídas: [(1, {'mae': 0.51, 'mse': 0.42}), ...]
+```
+
+### Saída Esperada por Rodada (Croston)
+
+```
+[Rodada  1] Estado global agregado → demand_level=142.3021, interval=3.8740
+[Rodada  2] Estado global agregado → demand_level=139.7654, interval=3.9102
+...
+[Rodada 10] Estado global agregado → demand_level=137.1203, interval=4.0551
+
+=== Histórico de Treinamento (Croston Federado) ===
+Losses distribuídas (MSE): [(1, 18432.5), (2, 17821.3), ...]
+Métricas distribuídas (MAE): [(1, {'mae': 82.4}), ...]
+```
+
+### Configurações Principais
+
+| Parâmetro | Arquivo | Padrão | Descrição |
+|---|---|---|---|
+| `NUM_SERVER_ROUNDS` | `main.py` / `croston_main.py` | `10` | Rodadas federadas |
+| `fraction_fit` | servidor | `0.3` | Fração de clientes por rodada de treino |
+| `LOOKBACK` | `dataset.py` | `28` | Janela deslizante em dias (XGBoost) |
+| `CROSTON_ALPHA` | `croston_main.py` | `0.1` | Suavização do nível de demanda |
+| `CROSTON_BETA` | `croston_main.py` | `0.1` | Suavização do intervalo entre demandas |
+| `CROSTON_VARIANT` | `croston_main.py` | `"sba"` | `"sba"` (recomendado) ou `"original"` |
+| `num_boost_round` | `centralized.py` | `50` | Rounds do XGBoost centralizado |
+| `noise_multiplier` | `experiment.py` | `1.0` | Intensidade do ruído diferencial (PyTorch) |
+| `clip_norm` | `experiment.py` | `1.0` | Sensitividade do gradiente (PyTorch) |
