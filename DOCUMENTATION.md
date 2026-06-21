@@ -69,9 +69,13 @@ Fluxo completo da leitura dos CSVs até a métrica agregada no servidor:
 
 | Função | Retorno | Usada por |
 |---|---|---|
-| `load_data(partition_id, num_partitions)` | `(X_train, y_train, X_test, y_test)` como `np.ndarray` | `main.py`, `centralized.py` |
+| `load_data(partition_id, *, return_scaler=False)` | `(X_train, y_train, X_test, y_test[, scaler])` | `main.py` (federado) |
 | `load_data_torch(partition_id, num_partitions)` | `(train_loader, test_loader)` DataLoaders PyTorch | `experiment.py` e modelos PyTorch |
-| `load_timeseries(partition_id, num_partitions)` | `(y_train, y_test)` como `np.ndarray` 1-D | `croston_main.py`, `centralized.py` |
+| `load_timeseries(partition_id, num_partitions)` | `(y_train, y_test)` como `np.ndarray` 1-D | `croston_main.py`, `croston_ensemble_main.py` |
+| `load_all_data()` | `(X_train, y_train, X_test, y_test, train_sizes, test_sizes, scalers)` | `centralized.py` (XGBoost) |
+| `load_all_timeseries()` | `(y_trains, y_tests)` — listas com uma série por loja | `centralized.py` (Croston) |
+
+> **Por que funções separadas para centralizado e federado?** As funções federadas (`load_data`, `load_timeseries`) usam um `partition_id` que mapeia para uma loja específica — essa interface é projetada para o Flower. As funções centralizadas (`load_all_data`, `load_all_timeseries`) carregam todas as lojas de uma vez, sem o conceito de partição, e retornam informações adicionais (tamanhos por loja, scalers) necessárias para computar métricas na escala bruta de vendas.
 
 > **Nota:** `load_data()` retorna arrays NumPy diretamente (não DataLoaders). Para usar com PyTorch, utilize `load_data_torch()`, que aplica o mesmo pré-processamento e empacota os arrays em `DataLoader`.
 
@@ -481,45 +485,60 @@ ensemble_pred = np.average(predictions, weights=weights)
 
 `centralized.py` implementa versões centralizadas de ambos os modelos. Serve como **teto de referência**: o melhor resultado teoricamente alcançável por cada abordagem de modelagem, sem restrições de privacidade ou federação.
 
+Ambas as funções usam as APIs sem partição (`load_all_data`, `load_all_timeseries`) e reportam métricas em **unidades brutas de vendas**, tornando XGBoost e Croston diretamente comparáveis.
+
 ```bash
 python centralized.py   # executa os dois baselines e imprime o resumo
 ```
 
+### Comparabilidade das Métricas
+
+| Modelo | Escala original das previsões | Como as métricas são calculadas |
+|---|---|---|
+| **XGBoost** | Normalizada (StandardScaler por loja) | `inverse_transform` por scaler de loja → escala bruta |
+| **Croston** | Bruta (série sem normalização) | Direto — já está em escala bruta |
+
+Sem o `inverse_transform`, o MSE do XGBoost seria algo como `0.42` (unitless) enquanto o Croston reportaria `18 000` (unidades de vendas²) — impossível comparar. Após a transformação inversa, ambos estão na mesma escala.
+
 ### XGBoost Centralizado — `run_centralized_xgboost()`
 
-Todos os dados de treino das 10 lojas são **concatenados** e um único modelo é treinado com 50 rounds. O modelo aprende padrões cross-loja — algo impossível no cenário federado, onde cada cliente só vê seus próprios dados.
+Usa `load_all_data()` para carregar todas as lojas de uma vez. Um único modelo é treinado no conjunto concatenado com 50 rounds, aprende padrões cross-loja e reporta métricas em escala bruta via `inverse_transform`:
 
 ```python
-X_all_train = np.concatenate(X_trains, axis=0)   # dados de todas as lojas
-y_all_train = np.concatenate(y_trains, axis=0)
+X_all_train, y_all_train, X_all_test, y_all_test, \
+    train_sizes, test_sizes, sales_scalers = load_all_data()
 
 bst = xgb.train(XGB_PARAMS, dtrain, num_boost_round=50)
+preds_norm = bst.predict(dtest)
 
-# Métricas globais + por loja (para comparação direta com o federado)
+# Inverse_transform por loja → escala bruta de vendas
+for i, (n, scaler) in enumerate(zip(test_sizes, sales_scalers)):
+    store_pred_raw = scaler.inverse_transform(preds_norm[offset:offset+n].reshape(-1,1))
+    store_actual_raw = scaler.inverse_transform(y_all_test[offset:offset+n].reshape(-1,1))
+    # MSE/MAE em unidades brutas
 ```
 
-**Por que é o teto?** O modelo centralizado tem acesso simultâneo a todas as lojas e usa 50 rounds (vs. 5 locais no federado), capturando padrões que nenhum cliente federated individual consegue observar.
+**Por que é o teto?** O modelo centralizado tem acesso simultâneo a todas as lojas e usa 50 rounds (vs. 5 locais no federado), capturando padrões que nenhum cliente federado individual consegue observar.
 
 ### Croston Centralizado — `run_centralized_croston()`
 
-Cada loja tem seu próprio modelo Croston treinado com acesso irrestrito aos seus dados. O ensemble é formado por **todos os 10 modelos simultaneamente** — sem a limitação de `fraction_fit` do cenário federado.
+Usa `load_all_timeseries()` para carregar todas as séries de uma vez. Cada loja tem seu próprio modelo Croston. O ensemble é ponderado por `1/MAE` (mesmo critério do `croston_ensemble_main.py`):
 
 ```python
-# Um modelo por loja, com acesso a todos os dados locais
-for i in range(NUM_PARTITIONS):
+y_trains, y_tests = load_all_timeseries()
+
+for y_train, y_test in zip(y_trains, y_tests):
     m = CrostonForecaster(alpha=alpha, beta=beta, variant=variant)
     m.fit(y_train)
-    models.append(m)
-    weights.append(float(len(y_train)))
+    _, local_mae = m.evaluate(y_test)
+    inv_mae_weights.append(1.0 / (local_mae + 1e-9))
 
-# Ensemble: média ponderada pelo tamanho de cada série de treino
-ensemble_forecast = sum(
-    (w / total_weight) * m.predict()
-    for m, w in zip(models, weights)
-)
+# Ensemble ponderado por 1/MAE — igual ao cenário federado
+weights = [w / sum(inv_mae_weights) for w in inv_mae_weights]
+ensemble_forecast = sum(w * m.predict() for w, m in zip(weights, models))
 ```
 
-**Relação com o federado:** após rodadas suficientes para todos os clientes participarem ao menos uma vez, o ensemble federado converge para este resultado — os dados locais não mudam entre rodadas. A diferença na prática vem de `fraction_fit < 1.0` e da influência do warm-start global no estado de suavização.
+**Relação com o federado:** após rodadas suficientes para todos os clientes participarem ao menos uma vez, o `croston_ensemble_main.py` converge para este resultado. A diferença na prática vem de `fraction_fit < 1.0` — nem todos os clientes participam em toda rodada.
 
 ---
 

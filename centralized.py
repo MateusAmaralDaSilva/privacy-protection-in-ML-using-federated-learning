@@ -5,18 +5,20 @@ processo de treinamento acessa tudo simultaneamente.
 Serve como teto de referência: o melhor resultado teoricamente alcançável
 por cada abordagem de modelagem, sem restrições de privacidade ou federação.
 
+Métricas reportadas em unidades BRUTAS de vendas (não normalizadas) para
+permitir comparação direta entre XGBoost e Croston.
+
 Comparação direta com:
-  - main.py        → XGBoost federado (bagging, 10 rodadas)
-  - croston_main.py → Croston ensemble federado (10 rodadas)
+  - main.py                  → XGBoost federado
+  - croston_main.py          → Croston FedAvg federado
+  - croston_ensemble_main.py → Croston ensemble federado
 """
 
 import numpy as np
 import xgboost as xgb
 
-from dataset import load_data, load_timeseries, STORE_IDS
+from dataset import load_all_data, load_all_timeseries, STORE_IDS
 from croston_model import CrostonForecaster
-
-NUM_PARTITIONS = 10
 
 XGB_PARAMS = {
     "objective":        "reg:squarederror",
@@ -30,9 +32,12 @@ XGB_PARAMS = {
 # ---------------------------------------------------------------------------
 # XGBoost Centralizado
 #
-# Todos os dados de treino das 10 lojas são concatenados e um único modelo
-# é treinado. O modelo aprende padrões cross-loja (algo impossível no cenário
-# federado, onde cada cliente só vê seus próprios dados).
+# Todos os dados de todas as lojas são carregados de uma vez (load_all_data).
+# Um único modelo é treinado no conjunto concatenado — aprende padrões
+# cross-loja impossíveis no cenário federado.
+#
+# As previsões são inverse_transformed por scaler de loja para que as métricas
+# finais estejam em unidades brutas de vendas, comparáveis com o Croston.
 # ---------------------------------------------------------------------------
 
 def run_centralized_xgboost(num_boost_round: int = 50) -> tuple[float, float]:
@@ -40,20 +45,11 @@ def run_centralized_xgboost(num_boost_round: int = 50) -> tuple[float, float]:
     print("  Baseline Centralizado — XGBoost")
     print("=" * 60)
 
-    X_trains, y_trains, X_tests, y_tests = [], [], [], []
+    X_all_train, y_all_train, X_all_test, y_all_test, \
+        train_sizes, test_sizes, sales_scalers = load_all_data()
 
-    for i in range(NUM_PARTITIONS):
-        X_tr, y_tr, X_te, y_te = load_data(i, NUM_PARTITIONS)
-        X_trains.append(X_tr)
-        y_trains.append(y_tr)
-        X_tests.append(X_te)
-        y_tests.append(y_te)
-        print(f"  Loja {STORE_IDS[i]:>5s} → treino={len(X_tr):>5d}, teste={len(X_te):>4d}")
-
-    X_all_train = np.concatenate(X_trains, axis=0)
-    y_all_train = np.concatenate(y_trains, axis=0)
-    X_all_test  = np.concatenate(X_tests,  axis=0)
-    y_all_test  = np.concatenate(y_tests,  axis=0)
+    for i, (n_tr, n_te) in enumerate(zip(train_sizes, test_sizes)):
+        print(f"  Loja {STORE_IDS[i]:>5s} → treino={n_tr:>5d}, teste={n_te:>4d}")
 
     print(f"\n  Total treino: {len(X_all_train):>6d} amostras (todas as lojas)")
     print(f"  Total teste:  {len(X_all_test):>6d} amostras")
@@ -68,24 +64,32 @@ def run_centralized_xgboost(num_boost_round: int = 50) -> tuple[float, float]:
         verbose_eval=False,
     )
 
-    preds = bst.predict(dtest)
-    mse = float(np.mean((y_all_test - preds) ** 2))
-    mae = float(np.mean(np.abs(y_all_test - preds)))
+    # Previsões em espaço normalizado
+    preds_norm = bst.predict(dtest)
 
-    print(f"\n  MSE global: {mse:.6f}")
-    print(f"  MAE global: {mae:.6f}")
-
-    # Métricas por loja para comparação direta com o cenário federado
-    print("\n  Métricas por loja:")
+    # Inverse_transform por loja para escala bruta de vendas
+    all_errors_sq, all_errors_abs = [], []
+    print("\n  Métricas por loja (escala bruta de vendas):")
     offset = 0
-    for i in range(NUM_PARTITIONS):
-        n = len(y_tests[i])
-        store_preds = preds[offset : offset + n]
-        store_mse = float(np.mean((y_tests[i] - store_preds) ** 2))
-        store_mae = float(np.mean(np.abs(y_tests[i] - store_preds)))
-        print(f"    {STORE_IDS[i]:>5s} → MSE={store_mse:.6f}, MAE={store_mae:.6f}")
+    for i, (n, scaler) in enumerate(zip(test_sizes, sales_scalers)):
+        store_pred_norm   = preds_norm[offset:offset + n].reshape(-1, 1)
+        store_actual_norm = y_all_test[offset:offset + n].reshape(-1, 1)
+
+        store_pred_raw   = scaler.inverse_transform(store_pred_norm).flatten()
+        store_actual_raw = scaler.inverse_transform(store_actual_norm).flatten()
+
+        errs = store_actual_raw - store_pred_raw
+        store_mse = float(np.mean(errs ** 2))
+        store_mae = float(np.mean(np.abs(errs)))
+        all_errors_sq.extend(errs ** 2)
+        all_errors_abs.extend(np.abs(errs))
+        print(f"    {STORE_IDS[i]:>5s} → MSE={store_mse:.4f}, MAE={store_mae:.4f}")
         offset += n
 
+    mse = float(np.mean(all_errors_sq))
+    mae = float(np.mean(all_errors_abs))
+    print(f"\n  MSE global (bruto): {mse:.4f}")
+    print(f"  MAE global (bruto): {mae:.4f}")
     return mse, mae
 
 
@@ -93,12 +97,11 @@ def run_centralized_xgboost(num_boost_round: int = 50) -> tuple[float, float]:
 # Croston Centralizado
 #
 # Cada loja tem seu próprio modelo Croston treinado com acesso irrestrito
-# aos seus dados. O ensemble é formado por TODOS os 10 modelos simultaneamente
+# aos seus dados. O ensemble é formado por TODOS os modelos simultaneamente
 # — sem a limitação de fraction_fit do cenário federado.
 #
-# Este é o teto teórico para o croston_main.py:
-#   Após rounds suficientes para todos os clientes participarem, o ensemble
-#   federado converge para este resultado (os dados locais nunca mudam).
+# Métricas calculadas em unidades brutas de vendas (load_all_timeseries
+# retorna séries sem normalização).
 # ---------------------------------------------------------------------------
 
 def run_centralized_croston(
@@ -110,59 +113,56 @@ def run_centralized_croston(
     print("  Baseline Centralizado — Croston / SBA (Ensemble Completo)")
     print("=" * 60)
 
+    y_trains, y_tests = load_all_timeseries()
+
     models: list[CrostonForecaster] = []
-    weights: list[float] = []
-    y_tests: list[np.ndarray] = []
+    inv_mae_weights: list[float] = []
 
-    for i in range(NUM_PARTITIONS):
-        y_train, y_test = load_timeseries(i, NUM_PARTITIONS)
-
+    for i, (y_train, y_test) in enumerate(zip(y_trains, y_tests)):
         m = CrostonForecaster(alpha=alpha, beta=beta, variant=variant)
         m.fit(y_train)
 
         forecast = m.predict()
+        _, local_mae = m.evaluate(y_test)
+
         models.append(m)
-        weights.append(float(len(y_train)))
-        y_tests.append(y_test)
+        inv_mae_weights.append(1.0 / (local_mae + 1e-9))
 
         print(
             f"  Loja {STORE_IDS[i]:>5s} → "
             f"demand_level={m.demand_level:.4f}, "
             f"interval={m.interval:.4f}, "
-            f"forecast={forecast:.4f}"
+            f"forecast={forecast:.4f}, "
+            f"MAE={local_mae:.4f}"
         )
 
-    # Ensemble centralizado: média ponderada das previsões de todas as lojas
-    total_weight = sum(weights)
-    ensemble_forecast = sum(
-        (w / total_weight) * m.predict()
-        for m, w in zip(models, weights)
-    )
+    # Pesos normalizados pelo inverso do MAE local (igual ao ensemble federado)
+    total_w = sum(inv_mae_weights)
+    weights = [w / total_w for w in inv_mae_weights]
 
-    print(f"\n  Previsão ensemble (média ponderada): {ensemble_forecast:.4f}")
+    ensemble_forecast = sum(w * m.predict() for w, m in zip(weights, models))
+    print(f"\n  Previsão ensemble (ponderada por 1/MAE): {ensemble_forecast:.4f}")
 
     # Avaliação: cada loja avalia o ensemble global nos seus dados de teste
-    all_errors_sq  = []
-    all_errors_abs = []
-    print("\n  Métricas por loja (ensemble aplicado aos dados de teste):")
-    for i in range(NUM_PARTITIONS):
-        errors = y_tests[i].astype(np.float64) - ensemble_forecast
-        store_mse = float(np.mean(errors ** 2))
-        store_mae = float(np.mean(np.abs(errors)))
-        all_errors_sq.extend(errors ** 2)
-        all_errors_abs.extend(np.abs(errors))
-        print(f"    {STORE_IDS[i]:>5s} → MSE={store_mse:.6f}, MAE={store_mae:.6f}")
+    all_errors_sq, all_errors_abs = [], []
+    print("\n  Métricas por loja (escala bruta de vendas):")
+    for i, y_test in enumerate(y_tests):
+        errs = y_test.astype(np.float64) - ensemble_forecast
+        store_mse = float(np.mean(errs ** 2))
+        store_mae = float(np.mean(np.abs(errs)))
+        all_errors_sq.extend(errs ** 2)
+        all_errors_abs.extend(np.abs(errs))
+        print(f"    {STORE_IDS[i]:>5s} → MSE={store_mse:.4f}, MAE={store_mae:.4f}")
 
     mse = float(np.mean(all_errors_sq))
     mae = float(np.mean(all_errors_abs))
-    print(f"\n  MSE global: {mse:.6f}")
-    print(f"  MAE global: {mae:.6f}")
-
+    print(f"\n  MSE global (bruto): {mse:.4f}")
+    print(f"  MAE global (bruto): {mae:.4f}")
     return mse, mae
 
 
 # ---------------------------------------------------------------------------
-# Ponto de entrada — executa os dois baselines e imprime o resumo comparativo
+# Ponto de entrada
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -170,11 +170,14 @@ if __name__ == "__main__":
     cro_mse, cro_mae = run_centralized_croston()
 
     print("\n" + "=" * 60)
-    print("  Resumo — Baselines Centralizados")
+    print("  Resumo — Baselines Centralizados (escala bruta de vendas)")
     print("=" * 60)
-    print(f"  XGBoost  → MSE={xgb_mse:.6f}  MAE={xgb_mae:.6f}")
-    print(f"  Croston  → MSE={cro_mse:.6f}  MAE={cro_mae:.6f}")
+    print(f"  XGBoost  → MSE={xgb_mse:.4f}  MAE={xgb_mae:.4f}")
+    print(f"  Croston  → MSE={cro_mse:.4f}  MAE={cro_mae:.4f}")
+    print()
+    print("  Ambas as métricas estão em unidades brutas de vendas — comparáveis.")
     print()
     print("  Compare com os resultados federados em:")
-    print("    python main.py          (XGBoost federado)")
-    print("    python croston_main.py  (Croston ensemble federado)")
+    print("    python main.py                  (XGBoost federado)")
+    print("    python croston_main.py          (Croston FedAvg federado)")
+    print("    python croston_ensemble_main.py (Croston ensemble federado)")

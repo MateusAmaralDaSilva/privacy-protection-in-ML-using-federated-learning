@@ -53,6 +53,24 @@ def _add_cyclical(df: pd.DataFrame, col: str, period: int) -> None:
     df[f"cos_{col}"] = np.cos(2 * np.pi * df[col] / period).astype(np.float32)
 
 
+def load_all_timeseries() -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """
+    Carrega as séries temporais brutas de TODAS as lojas sem o conceito de
+    partições federadas. Uso exclusivo do baseline centralizado do Croston.
+
+    Returns
+    -------
+    y_trains : list[np.ndarray]  — série de treino por loja (ordem STORE_IDS)
+    y_tests  : list[np.ndarray]  — série de teste por loja
+    """
+    y_trains, y_tests = [], []
+    for i in range(len(STORE_IDS)):
+        y_tr, y_te = load_timeseries(i)
+        y_trains.append(y_tr)
+        y_tests.append(y_te)
+    return y_trains, y_tests
+
+
 def load_timeseries(partition_id: int, num_partitions: int = 10) -> tuple[np.ndarray, np.ndarray]:
     """
     Retorna a série temporal de vendas diárias (após clipping IQR) para uma loja.
@@ -83,7 +101,52 @@ def load_timeseries(partition_id: int, num_partitions: int = 10) -> tuple[np.nda
     return sales[:split], sales[split:]
 
 
-def load_data(partition_id: int, num_partitions: int = 10):
+def load_all_data() -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    list[int], list[int], list[StandardScaler],
+]:
+    """
+    Carrega e concatena os dados de features de TODAS as lojas sem o conceito
+    de partições federadas. Uso exclusivo do baseline centralizado do XGBoost.
+
+    Cada loja mantém seu próprio StandardScaler (ajustado apenas no treino
+    local), que é retornado para permitir inverse_transform das previsões de
+    volta à escala original de vendas — tornando as métricas comparáveis com
+    o Croston, que opera em unidades brutas.
+
+    Returns
+    -------
+    X_train, y_train, X_test, y_test : np.ndarray
+        Arrays concatenados de todas as lojas (normalized).
+    train_sizes : list[int]
+        Número de amostras de treino por loja.
+    test_sizes : list[int]
+        Número de amostras de teste por loja (para desagregar métricas).
+    sales_scalers : list[StandardScaler]
+        Um scaler por loja (mesma ordem de STORE_IDS) para inverse_transform.
+    """
+    X_trains, y_trains, X_tests, y_tests, scalers = [], [], [], [], []
+    for i in range(len(STORE_IDS)):
+        X_tr, y_tr, X_te, y_te, scaler = load_data(i, return_scaler=True)
+        X_trains.append(X_tr)
+        y_trains.append(y_tr)
+        X_tests.append(X_te)
+        y_tests.append(y_te)
+        scalers.append(scaler)
+    train_sizes = [len(y) for y in y_trains]
+    test_sizes  = [len(y) for y in y_tests]
+    return (
+        np.concatenate(X_trains, axis=0),
+        np.concatenate(y_trains, axis=0),
+        np.concatenate(X_tests,  axis=0),
+        np.concatenate(y_tests,  axis=0),
+        train_sizes,
+        test_sizes,
+        scalers,
+    )
+
+
+def load_data(partition_id: int, num_partitions: int = 10, return_scaler: bool = False):
     """
     Build train/test DataLoaders for one store partition.
 
@@ -215,6 +278,8 @@ def load_data(partition_id: int, num_partitions: int = 10):
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
 
+    if return_scaler:
+        return X_train, y_train, X_test, y_test, sales_scaler
     return X_train, y_train, X_test, y_test
 
 
