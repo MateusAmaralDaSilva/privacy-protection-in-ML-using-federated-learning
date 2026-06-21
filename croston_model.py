@@ -109,21 +109,25 @@ class CrostonForecaster:
     # Avaliação
     # ------------------------------------------------------------------
 
-    def evaluate(self, y_test: np.ndarray) -> tuple[float, float]:
+    def evaluate(self, y_test: np.ndarray) -> tuple[float, float, float, float]:
         """
         Avalia o modelo em uma série de teste.
         A previsão de Croston é constante ao longo do horizonte.
 
         Returns
         -------
-        (mse, mae) : tuple[float, float]
+        (mse, mae, rmse, r2) : tuple[float, float, float, float]
         """
         forecast = self.predict()
         y_test = np.asarray(y_test, dtype=np.float64)
         errors = y_test - forecast
-        mse = float(np.mean(errors ** 2))
-        mae = float(np.mean(np.abs(errors)))
-        return mse, mae
+        ss_res = float(np.sum(errors ** 2))
+        ss_tot = float(np.sum((y_test - np.mean(y_test)) ** 2))
+        mse  = ss_res / len(y_test)
+        mae  = float(np.mean(np.abs(errors)))
+        rmse = float(np.sqrt(mse))
+        r2   = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        return mse, mae, rmse, r2
 
     # ------------------------------------------------------------------
     # Serialização para o Flower

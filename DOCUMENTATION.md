@@ -14,8 +14,9 @@ Dez lojas treinam seus próprios modelos localmente. Apenas os parâmetros apren
    5b. [Croston Ensemble — Independência Estatística](#5b-croston-ensemble--independência-estatística)
 6. [Baselines Centralizados](#6-baselines-centralizados)
 7. [Validade do Pipeline de Avaliação](#7-validade-do-pipeline-de-avaliação)
-8. [XGBoost vs Croston — Comparação](#8-xgboost-vs-croston--comparação)
-9. [Como Executar](#9-como-executar)
+8. [Guia de Interpretação das Métricas](#8-guia-de-interpretação-das-métricas)
+9. [XGBoost vs Croston — Comparação](#9-xgboost-vs-croston--comparação)
+10. [Como Executar](#10-como-executar)
 
 ---
 
@@ -597,7 +598,54 @@ Mesmo com métricas na mesma escala (bruta de vendas), o XGBoost resolve um prob
 
 ---
 
-## 8. XGBoost vs Croston — Comparação
+## 8. Guia de Interpretação das Métricas
+
+Todas as métricas estão em **escala bruta de vendas** (unidades/dia), exceto R² que é adimensional.
+
+### O que cada métrica mede
+
+| Métrica | Fórmula | Unidade | Interpreta-se como… |
+|---|---|---|---|
+| **RMSE** | `√(Σ(y−ŷ)² / n)` | vendas/dia | Erro típico de previsão. Se RMSE=150, o modelo erra em média ~150 unidades por dia |
+| **MAE** | `Σ|y−ŷ| / n` | vendas/dia | Erro médio absoluto. Mais robusto a dias atípicos (picos de promoção, etc.) |
+| **MSE** | `Σ(y−ŷ)² / n` | (vendas/dia)² | Base interna de otimização. Difícil de ler diretamente — prefira RMSE |
+| **R²** | `1 − SS_res/SS_tot` | adimensional [−∞, 1] | Fração da variação de demanda explicada pelo modelo |
+
+### Como ler o R²
+
+```
+R² = 1.0   → previsão perfeita
+R² = 0.0   → o modelo não é melhor do que prever sempre a média histórica
+R² < 0.0   → o modelo é pior do que prever a média (comum no Croston sobre dados sazonais)
+```
+
+O R² é calculado por loja e globalmente. No cenário federado, o valor reportado é a **média ponderada** por número de amostras entre os clientes avaliados naquela rodada — uma aproximação do R² global real.
+
+### O que significa "Loss" no histórico do Flower
+
+```python
+hist.losses_distributed  # ex: [(1, 18432.5), (2, 17210.3), ...]
+```
+
+Cada tupla é `(rodada, MSE_ponderado)`. É o mesmo MSE reportado como `loss` pelo cliente em `evaluate()`. O valor está em (vendas/dia)² — tire a raiz quadrada para obter o RMSE em escala legível.
+
+### Exemplo de leitura prática
+
+```
+XGBoost  → RMSE=120.4  MAE=89.2  R²=0.61
+Croston  → RMSE=310.7  MAE=248.3 R²=-0.42
+```
+
+- **XGBoost**: erra ~120 unidades/dia em média; explica 61% da variação de demanda.
+- **Croston**: erra ~311 unidades/dia; R² negativo indica que prever a média histórica seria melhor. Isso reflete a inadequação do método para demanda agregada contínua e sazonal (ver seção 7).
+
+### RMSE vs MAE — quando divergem
+
+Se `RMSE >> MAE`, existem dias com erros muito grandes (ex: picos de promoção). Se forem próximos, os erros são distribuídos de forma uniforme.
+
+---
+
+## 9. XGBoost vs Croston — Comparação
 
 | Dimensão | XGBoost (`main.py`) | Croston FedAvg (`croston_main.py`) | Croston Ensemble (`croston_ensemble_main.py`) |
 |---|---|---|---|

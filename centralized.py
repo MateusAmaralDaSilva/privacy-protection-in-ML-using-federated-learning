@@ -79,18 +79,34 @@ def run_centralized_xgboost(num_boost_round: int = 50) -> tuple[float, float]:
         store_actual_raw = scaler.inverse_transform(store_actual_norm).flatten()
 
         errs = store_actual_raw - store_pred_raw
-        store_mse = float(np.mean(errs ** 2))
-        store_mae = float(np.mean(np.abs(errs)))
+        ss_res_s = float(np.sum(errs ** 2))
+        ss_tot_s = float(np.sum((store_actual_raw - np.mean(store_actual_raw)) ** 2))
+        store_mse  = ss_res_s / len(errs)
+        store_mae  = float(np.mean(np.abs(errs)))
+        store_rmse = float(np.sqrt(store_mse))
+        store_r2   = 1.0 - ss_res_s / ss_tot_s if ss_tot_s > 0 else 0.0
         all_errors_sq.extend(errs ** 2)
         all_errors_abs.extend(np.abs(errs))
-        print(f"    {STORE_IDS[i]:>5s} → MSE={store_mse:.4f}, MAE={store_mae:.4f}")
+        print(f"    {STORE_IDS[i]:>5s} → RMSE={store_rmse:.4f}  MAE={store_mae:.4f}  R²={store_r2:.4f}")
         offset += n
 
-    mse = float(np.mean(all_errors_sq))
-    mae = float(np.mean(all_errors_abs))
-    print(f"\n  MSE global (bruto): {mse:.4f}")
-    print(f"  MAE global (bruto): {mae:.4f}")
-    return mse, mae
+    all_errs = np.array(all_errors_sq)
+    mse  = float(np.mean(all_errs))
+    mae  = float(np.mean(all_errors_abs))
+    rmse = float(np.sqrt(mse))
+    # R² global: sobre todas as lojas concatenadas (escala bruta)
+    all_actual = np.concatenate([
+        sales_scalers[i].inverse_transform(y_all_test[
+            sum(test_sizes[:i]):sum(test_sizes[:i+1])
+        ].reshape(-1, 1)).flatten()
+        for i in range(len(test_sizes))
+    ])
+    ss_tot_g = float(np.sum((all_actual - np.mean(all_actual)) ** 2))
+    r2 = 1.0 - float(np.sum(all_errs)) / ss_tot_g if ss_tot_g > 0 else 0.0
+    print(f"\n  RMSE global (bruto): {rmse:.4f}")
+    print(f"  MAE  global (bruto): {mae:.4f}")
+    print(f"  R²   global:         {r2:.4f}")
+    return mse, mae, rmse, r2
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +141,7 @@ def run_centralized_croston(
         forecast = m.predict()
         # Pesos calculados pelo MAE no TREINO — consistente com o cenário federado,
         # onde fit() reporta erro de treino e y_test é reservado para evaluate().
-        _, mae_train = m.evaluate(y_train)
+        _, mae_train, _, _ = m.evaluate(y_train)
 
         models.append(m)
         inv_mae_weights.append(1.0 / (mae_train + 1e-9))
@@ -146,21 +162,33 @@ def run_centralized_croston(
     print(f"\n  Previsão ensemble (ponderada por 1/MAE): {ensemble_forecast:.4f}")
 
     # Avaliação: cada loja avalia o ensemble global nos seus dados de teste
-    all_errors_sq, all_errors_abs = [], []
+    all_errors_sq, all_errors_abs, all_actual, all_pred = [], [], [], []
     print("\n  Métricas por loja (escala bruta de vendas):")
     for i, y_test in enumerate(y_tests):
-        errs = y_test.astype(np.float64) - ensemble_forecast
-        store_mse = float(np.mean(errs ** 2))
-        store_mae = float(np.mean(np.abs(errs)))
+        y_test_f = y_test.astype(np.float64)
+        errs = y_test_f - ensemble_forecast
+        ss_res_s = float(np.sum(errs ** 2))
+        ss_tot_s = float(np.sum((y_test_f - np.mean(y_test_f)) ** 2))
+        store_mse  = ss_res_s / len(errs)
+        store_mae  = float(np.mean(np.abs(errs)))
+        store_rmse = float(np.sqrt(store_mse))
+        store_r2   = 1.0 - ss_res_s / ss_tot_s if ss_tot_s > 0 else 0.0
         all_errors_sq.extend(errs ** 2)
         all_errors_abs.extend(np.abs(errs))
-        print(f"    {STORE_IDS[i]:>5s} → MSE={store_mse:.4f}, MAE={store_mae:.4f}")
+        all_actual.extend(y_test_f)
+        print(f"    {STORE_IDS[i]:>5s} → RMSE={store_rmse:.4f}  MAE={store_mae:.4f}  R²={store_r2:.4f}")
 
-    mse = float(np.mean(all_errors_sq))
-    mae = float(np.mean(all_errors_abs))
-    print(f"\n  MSE global (bruto): {mse:.4f}")
-    print(f"  MAE global (bruto): {mae:.4f}")
-    return mse, mae
+    all_actual_arr = np.array(all_actual)
+    all_errs_sq    = np.array(all_errors_sq)
+    mse  = float(np.mean(all_errs_sq))
+    mae  = float(np.mean(all_errors_abs))
+    rmse = float(np.sqrt(mse))
+    ss_tot_g = float(np.sum((all_actual_arr - np.mean(all_actual_arr)) ** 2))
+    r2 = 1.0 - float(np.sum(all_errs_sq)) / ss_tot_g if ss_tot_g > 0 else 0.0
+    print(f"\n  RMSE global (bruto): {rmse:.4f}")
+    print(f"  MAE  global (bruto): {mae:.4f}")
+    print(f"  R²   global:         {r2:.4f}")
+    return mse, mae, rmse, r2
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +196,16 @@ def run_centralized_croston(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    xgb_mse, xgb_mae = run_centralized_xgboost()
-    cro_mse, cro_mae = run_centralized_croston()
+    xgb_mse, xgb_mae, xgb_rmse, xgb_r2 = run_centralized_xgboost()
+    cro_mse, cro_mae, cro_rmse, cro_r2 = run_centralized_croston()
 
     print("\n" + "=" * 60)
     print("  Resumo — Baselines Centralizados (escala bruta de vendas)")
     print("=" * 60)
-    print(f"  XGBoost  → MSE={xgb_mse:.4f}  MAE={xgb_mae:.4f}")
-    print(f"  Croston  → MSE={cro_mse:.4f}  MAE={cro_mae:.4f}")
+    print(f"  {'Modelo':<10} {'RMSE':>10} {'MAE':>10} {'R²':>8}")
+    print(f"  {'-'*40}")
+    print(f"  {'XGBoost':<10} {xgb_rmse:>10.4f} {xgb_mae:>10.4f} {xgb_r2:>8.4f}")
+    print(f"  {'Croston':<10} {cro_rmse:>10.4f} {cro_mae:>10.4f} {cro_r2:>8.4f}")
     print()
     print("  Ambas as métricas estão em unidades brutas de vendas — comparáveis.")
     print()

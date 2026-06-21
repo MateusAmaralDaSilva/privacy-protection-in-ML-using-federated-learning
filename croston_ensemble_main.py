@@ -139,7 +139,7 @@ class FlowerCrostonEnsembleClient(NumPyClient):
 
         # MAE no TREINO para calcular pesos do ensemble — evita vazar o conjunto
         # de teste na ponderação do servidor. O y_test é usado apenas em evaluate().
-        _, mae_train = model.evaluate(self.y_train)
+        _, mae_train, _, _ = model.evaluate(self.y_train)
         state = model.get_state()
         return [state], len(self.y_train), {"mae": mae_train}
 
@@ -177,9 +177,13 @@ class FlowerCrostonEnsembleClient(NumPyClient):
 
         y_test = np.asarray(self.y_test, dtype=np.float64)
         errors = y_test - ensemble_pred
-        mse = float(np.mean(errors ** 2))
-        mae = float(np.mean(np.abs(errors)))
-        return mse, len(self.y_test), {"mae": mae}
+        ss_res = float(np.sum(errors ** 2))
+        ss_tot = float(np.sum((y_test - np.mean(y_test)) ** 2))
+        mse  = ss_res / len(y_test)
+        mae  = float(np.mean(np.abs(errors)))
+        rmse = float(np.sqrt(mse))
+        r2   = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        return mse, len(self.y_test), {"mae": mae, "rmse": rmse, "r2": r2}
 
 
 def client_fn(context: Context):
@@ -199,8 +203,11 @@ def weighted_average(metrics):
     total = sum(n for n, _ in metrics)
     if total == 0:
         return {}
-    weighted_mae = sum(n * m.get("mae", 0.0) for n, m in metrics)
-    return {"mae": weighted_mae / total}
+    result = {}
+    for key in ("mae", "rmse", "r2"):
+        if any(key in m for _, m in metrics):
+            result[key] = sum(n * m.get(key, 0.0) for n, m in metrics) / total
+    return result
 
 
 def server_fn(context: Context) -> ServerAppComponents:

@@ -118,15 +118,15 @@ class FlowerCrostonClient(NumPyClient):
         Avalia o modelo global (estado recebido do servidor) nos dados de teste locais.
         """
         if not parameters or len(parameters) == 0 or parameters[0].size != 2:
-            return float("inf"), len(self.y_test), {"mae": float("inf")}
+            return float("inf"), len(self.y_test), {"mae": float("inf"), "rmse": float("inf"), "r2": float("-inf")}
 
         model = CrostonForecaster(
             alpha=CROSTON_ALPHA, beta=CROSTON_BETA, variant=CROSTON_VARIANT
         )
         model.set_state(parameters[0])
 
-        mse, mae = model.evaluate(self.y_test)
-        return mse, len(self.y_test), {"mae": mae}
+        mse, mae, rmse, r2 = model.evaluate(self.y_test)
+        return mse, len(self.y_test), {"mae": mae, "rmse": rmse, "r2": r2}
 
 
 def client_fn(context: Context):
@@ -146,8 +146,11 @@ def weighted_average(metrics):
     total = sum(n for n, _ in metrics)
     if total == 0:
         return {}
-    weighted_mae = sum(n * m.get("mae", 0.0) for n, m in metrics)
-    return {"mae": weighted_mae / total}
+    result = {}
+    for key in ("mae", "rmse", "r2"):
+        if any(key in m for _, m in metrics):
+            result[key] = sum(n * m.get(key, 0.0) for n, m in metrics) / total
+    return result
 
 
 def server_fn(context: Context) -> ServerAppComponents:

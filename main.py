@@ -195,9 +195,14 @@ class FlowerXGBoostClient(NumPyClient):
         all_preds = np.stack([bst.predict(dtest) for bst in boosters], axis=0)
         ensemble_preds = all_preds.mean(axis=0)
 
-        mse = float(np.mean((self.y_test - ensemble_preds) ** 2))
-        mae = float(np.mean(np.abs(self.y_test - ensemble_preds)))
-        return mse, len(self.X_test), {"mae": mae}
+        errors = self.y_test - ensemble_preds
+        ss_res = float(np.sum(errors ** 2))
+        ss_tot = float(np.sum((self.y_test - np.mean(self.y_test)) ** 2))
+        mse  = ss_res / len(self.y_test)
+        mae  = float(np.mean(np.abs(errors)))
+        rmse = float(np.sqrt(mse))
+        r2   = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        return mse, len(self.X_test), {"mae": mae, "rmse": rmse, "r2": r2}
 
 
 def client_fn(context: Context):
