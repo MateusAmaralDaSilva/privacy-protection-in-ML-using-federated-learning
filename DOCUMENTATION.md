@@ -12,7 +12,7 @@ Dez lojas treinam seus próprios modelos localmente. Apenas os parâmetros apren
 4. [XGBoost — Treinamento e Agregação](#4-xgboost--treinamento-e-agregação)
 5. [Croston — Modelo Estatístico e Agregação](#5-croston--modelo-estatístico-e-agregação)
    5b. [Croston Ensemble — Independência Estatística](#5b-croston-ensemble--independência-estatística)
-6. [Baselines Centralizados](#6-baselines-centralizados)
+6. [Baselines Centralizados e Modo Produto Único](#6-baselines-centralizados)
 7. [Validade do Pipeline de Avaliação](#7-validade-do-pipeline-de-avaliação)
 8. [Guia de Interpretação das Métricas](#8-guia-de-interpretação-das-métricas)
 9. [XGBoost vs Croston — Comparação](#9-xgboost-vs-croston--comparação)
@@ -36,12 +36,12 @@ O sistema segue o padrão de **federated learning horizontal**: cada cliente pos
 ### Estrutura de Arquivos
 
 ```
-dataset.py                  # load_data(), load_data_torch(), load_timeseries()
+dataset.py                  # load_data(), load_timeseries(), load_data_item(), load_timeseries_item(), …
 main.py                     # FlowerXGBoostClient · XgbEnsembleStrategy
 croston_model.py            # CrostonForecaster
 croston_main.py             # FlowerCrostonClient · CrostonFedAvgStrategy (FedAvg clássico)
 croston_ensemble_main.py    # FlowerCrostonEnsembleClient · CrostonEnsembleStrategy (sem agregação)
-centralized.py              # Baselines centralizados (teto de referência)
+centralized.py              # Baselines centralizados + modo produto único (--item / --store)
 ```
 
 ---
@@ -74,8 +74,12 @@ Fluxo completo da leitura dos CSVs até a métrica agregada no servidor:
 | `load_timeseries(partition_id, num_partitions)` | `(y_train, y_test)` como `np.ndarray` 1-D | `croston_main.py`, `croston_ensemble_main.py` |
 | `load_all_data()` | `(X_train, y_train, X_test, y_test, train_sizes, test_sizes, scalers)` | `centralized.py` (XGBoost) |
 | `load_all_timeseries()` | `(y_trains, y_tests)` — listas com uma série por loja | `centralized.py` (Croston) |
+| `load_data_item(item_id, store_id, *, return_scaler=False)` | `(X_train, y_train, X_test, y_test[, scaler])` | `main.py` (modo `ITEM_ID`), `centralized.py` (`--item`) |
+| `load_timeseries_item(item_id, store_id)` | `(y_train, y_test)` como `np.ndarray` 1-D | `croston_main.py`, `croston_ensemble_main.py` (modo `ITEM_ID`), `centralized.py` (`--item`) |
 
 > **Por que funções separadas para centralizado e federado?** As funções federadas (`load_data`, `load_timeseries`) usam um `partition_id` que mapeia para uma loja específica — essa interface é projetada para o Flower. As funções centralizadas (`load_all_data`, `load_all_timeseries`) carregam todas as lojas de uma vez, sem o conceito de partição, e retornam informações adicionais (tamanhos por loja, scalers) necessárias para computar métricas na escala bruta de vendas.
+
+> **Por que funções `_item` separadas?** `load_timeseries` e `load_data` somam todos os itens da loja por dia (`store_rows[day_cols].sum()`), produzindo séries contínuas raramente iguais a zero. As funções `_item` retornam a série bruta de um único SKU — com zeros reais — e usam o preço específico do item em vez da média da loja. Isso torna a série adequada para o Croston e preserva a semântica do produto individual no XGBoost.
 
 > **Nota:** `load_data()` retorna arrays NumPy diretamente (não DataLoaders). Para usar com PyTorch, utilize `load_data_torch()`, que aplica o mesmo pré-processamento e empacota os arrays em `DataLoader`.
 
@@ -488,8 +492,14 @@ ensemble_pred = np.average(predictions, weights=weights)
 Ambas as funções usam as APIs sem partição (`load_all_data`, `load_all_timeseries`) e reportam métricas em **unidades brutas de vendas**, tornando XGBoost e Croston diretamente comparáveis.
 
 ```bash
-python centralized.py   # executa os dois baselines e imprime o resumo
+# Modo padrão — todas as 10 lojas
+python centralized.py
+
+# Modo produto único — XGBoost + Croston num único SKU
+python centralized.py --item FOODS_3_090 --store CA_1
 ```
+
+No modo produto único, `centralized.py` chama `run_single_product(item_id, store_id)`, que usa `load_data_item` e `load_timeseries_item` para carregar a série bruta do item. O resultado é impresso em uma tabela comparativa idêntica à dos scripts federados, permitindo comparar diretamente com os experimentos federados no mesmo produto.
 
 ### Comparabilidade das Métricas
 
@@ -570,17 +580,19 @@ q1, q3 = train_sales_raw.quantile(0.25), train_sales_raw.quantile(0.75)
 
 **Correção:** todas essas métricas passam a usar o **conjunto de treino**. O `y_test` é usado exclusivamente em `evaluate()`.
 
-#### 3. Croston aplicado a demanda não-intermitente — LIMITAÇÃO CONHECIDA
+#### 3. Croston aplicado a demanda não-intermitente — LIMITAÇÃO NO MODO LOJA
 
-**Problema:** O método de Croston foi desenvolvido para séries com muitos zeros (demanda intermitente). No M5, as vendas são **somadas de todos os itens da loja** por dia:
+**Problema:** O método de Croston foi desenvolvido para séries com muitos zeros (demanda intermitente). No modo padrão (loja inteira), as vendas são **somadas de todos os itens da loja** por dia:
 ```python
 sales = store_rows[day_cols].sum().values  # centenas de itens somados
 ```
 A soma de centenas de itens raramente é zero — a série é **contínua e sazonal**, não intermitente. O Croston não captura sazonalidade semanal nem tendência, resultando em uma previsão constante para o horizonte inteiro.
 
-**Impacto:** o Croston produz resultados inferiores ao XGBoost não por ser um modelo federado inferior, mas por ser o modelo errado para o dado agregado. Para demanda ao nível de item individual (ex: `FOODS_3_090_CA_1`), o Croston seria apropriado.
+**Impacto no modo loja:** o Croston produz resultados inferiores ao XGBoost não por ser um modelo federado inferior, mas por ser o modelo errado para o dado agregado.
 
-**Alternativas ao Croston para demanda agregada:**
+**Modo produto único (`ITEM_ID` / `--item`):** ao treinar sobre a série bruta de um único SKU (`load_timeseries_item`), a série apresenta zeros reais — o Croston opera no regime para o qual foi projetado. Nesse modo a comparação com XGBoost é válida.
+
+**Alternativas ao Croston para demanda agregada de loja:**
 - Simple Exponential Smoothing (SES) — sem sazonalidade
 - Holt-Winters — com tendência e sazonalidade
 - SARIMA — sazonal com componente autorregressivo
@@ -682,14 +694,23 @@ pip install -r requirements.txt
 ### Baselines Centralizados (referência)
 
 ```bash
+# Todas as 10 lojas (modo padrão)
 python centralized.py
+
+# Produto único — XGBoost + Croston num único SKU
+python centralized.py --item FOODS_3_090 --store CA_1
 ```
 
-Executa `run_centralized_xgboost()` e `run_centralized_croston()` em sequência e imprime MSE/MAE global e por loja para cada modelo.
+Executa `run_centralized_xgboost()` e `run_centralized_croston()` em sequência (modo padrão), ou `run_single_product()` (modo `--item`), e imprime MSE/MAE global e por loja para cada modelo.
 
 ### Experimento XGBoost Federado
 
 ```bash
+# Modo padrão — demanda agregada por loja
+python main.py
+
+# Produto único — defina ITEM_ID no topo de main.py antes de executar
+# ITEM_ID = "FOODS_3_090"   ← altere aqui
 python main.py
 ```
 
@@ -698,14 +719,26 @@ python main.py
 ### Experimento Croston Federado (FedAvg)
 
 ```bash
+# Modo padrão — demanda agregada por loja
+python croston_main.py
+
+# Produto único — defina ITEM_ID no topo de croston_main.py antes de executar
+# ITEM_ID = "FOODS_3_090"   ← altere aqui
 python croston_main.py
 ```
 
 ### Experimento Croston Ensemble Federado (sem agregação de parâmetros)
 
 ```bash
+# Modo padrão — demanda agregada por loja
+python croston_ensemble_main.py
+
+# Produto único — defina ITEM_ID no topo de croston_ensemble_main.py antes de executar
+# ITEM_ID = "FOODS_3_090"   ← altere aqui
 python croston_ensemble_main.py
 ```
+
+> **Modo produto único nos scripts federados:** quando `ITEM_ID` está definido, cada um dos 10 clientes carrega a série bruta daquele SKU na **sua própria loja** (`FOODS_3_090 @ CA_1`, `FOODS_3_090 @ CA_2`, …). A série tem zeros reais, tornando o Croston estatisticamente adequado. Os scripts usam `load_timeseries_item(ITEM_ID, STORE_IDS[partition_id])` ou `load_data_item(ITEM_ID, STORE_IDS[partition_id])` conforme o modelo.
 
 ### Saída Esperada por Rodada (XGBoost)
 
@@ -757,3 +790,4 @@ Métricas distribuídas (MAE): [(1, {'mae': 75.2}), ...]
 | `CROSTON_BETA` | `croston_main.py` / `croston_ensemble_main.py` | `0.1` | Suavização do intervalo entre demandas |
 | `CROSTON_VARIANT` | `croston_main.py` / `croston_ensemble_main.py` | `"sba"` | `"sba"` (recomendado) ou `"original"` |
 | `num_boost_round` | `centralized.py` | `50` | Rounds do XGBoost centralizado |
+| `ITEM_ID` | `main.py` / `croston_main.py` / `croston_ensemble_main.py` | `None` | Se definido, cada cliente usa esse SKU na sua loja em vez da soma da loja inteira |

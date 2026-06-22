@@ -12,7 +12,7 @@ from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.server.strategy import FedAvg
 from flwr.simulation import run_simulation
 
-from dataset import load_data
+from dataset import load_data, load_data_item, STORE_IDS
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -20,6 +20,10 @@ from dataset import load_data
 
 NUM_PARTITIONS = 10
 NUM_SERVER_ROUNDS = 10
+
+# Defina ITEM_ID para treinar federado em um único produto (cada cliente = mesma
+# SKU numa loja diferente). None usa o comportamento padrão (soma da loja inteira).
+ITEM_ID: str | None = None  # ex: "FOODS_3_090"
 
 XGB_PARAMS = {
     "objective": "reg:squarederror",
@@ -207,10 +211,10 @@ class FlowerXGBoostClient(NumPyClient):
 
 def client_fn(context: Context):
     partition_id = context.node_config["partition-id"]
-    X_train, y_train, X_test, y_test = load_data(
-        partition_id=partition_id,
-        num_partitions=NUM_PARTITIONS,
-    )
+    if ITEM_ID is not None:
+        X_train, y_train, X_test, y_test = load_data_item(ITEM_ID, STORE_IDS[partition_id])
+    else:
+        X_train, y_train, X_test, y_test = load_data(partition_id=partition_id, num_partitions=NUM_PARTITIONS)
     return FlowerXGBoostClient(X_train, y_train, X_test, y_test).to_client()
 
 

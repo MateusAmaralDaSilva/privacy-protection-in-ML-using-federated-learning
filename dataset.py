@@ -288,6 +288,154 @@ def load_data(partition_id: int, num_partitions: int = 10, return_scaler: bool =
     return X_train, y_train, X_test, y_test
 
 
+def load_timeseries_item(item_id: str, store_id: str) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Retorna a série temporal de vendas diárias de um único item em uma loja.
+
+    Aplica o mesmo pré-processamento de load_timeseries() (NaN fill + IQR clipping),
+    mas opera sobre a série bruta do item — com zeros reais — em vez de somar
+    todos os itens da loja. Adequado para o Croston, que pressupõe demanda intermitente.
+    """
+    sales_raw = _load_sales()
+    item_row = sales_raw[
+        (sales_raw["store_id"] == store_id) &
+        (sales_raw["item_id"] == item_id)
+    ]
+    if item_row.empty:
+        available = sorted(sales_raw["item_id"].unique())[:10]
+        raise ValueError(
+            f"'{item_id}' não encontrado em '{store_id}'.\n"
+            f"Exemplos de item_ids disponíveis: {available}"
+        )
+
+    day_cols = [c for c in sales_raw.columns if c.startswith("d_")]
+    sales = item_row[day_cols].iloc[0].values.astype(np.float32)
+
+    sales = pd.Series(sales).ffill().bfill().fillna(0.0).values.astype(np.float32)
+
+    split = int(0.8 * len(sales))
+    q1 = float(np.quantile(sales[:split], 0.25))
+    q3 = float(np.quantile(sales[:split], 0.75))
+    iqr = q3 - q1
+    sales = np.clip(sales, q1 - 1.5 * iqr, q3 + 1.5 * iqr).astype(np.float32)
+
+    return sales[:split], sales[split:]
+
+
+def load_data_item(item_id: str, store_id: str, return_scaler: bool = False):
+    """
+    Constrói amostras de janela deslizante para um único item em uma loja.
+
+    Idêntico a load_data() na estrutura de features e normalização, com duas
+    diferenças: usa a série bruta do item (não a soma da loja) e o preço é
+    específico do item (não a média de todos os itens da loja).
+    """
+    state = store_id.split("_")[0]
+
+    sales_raw = _load_sales()
+    calendar = _load_calendar()
+    prices = _load_prices()
+
+    item_row = sales_raw[
+        (sales_raw["store_id"] == store_id) &
+        (sales_raw["item_id"] == item_id)
+    ]
+    if item_row.empty:
+        available = sorted(sales_raw["item_id"].unique())[:10]
+        raise ValueError(
+            f"'{item_id}' não encontrado em '{store_id}'.\n"
+            f"Exemplos de item_ids disponíveis: {available}"
+        )
+
+    day_cols = [c for c in sales_raw.columns if c.startswith("d_")]
+    daily = item_row[day_cols].T.reset_index()
+    daily.columns = ["d", "sales"]
+    daily["sales"] = daily["sales"].astype(np.float32)
+
+    daily["sales"] = daily["sales"].ffill().bfill().fillna(0.0)
+
+    n_raw = len(daily)
+    train_end_raw = int(0.8 * (n_raw - LOOKBACK)) + LOOKBACK
+    train_sales_raw = daily["sales"].iloc[:train_end_raw]
+    q1, q3 = train_sales_raw.quantile(0.25), train_sales_raw.quantile(0.75)
+    iqr = q3 - q1
+    daily["sales"] = daily["sales"].clip(lower=q1 - 1.5 * iqr, upper=q3 + 1.5 * iqr)
+
+    cal_cols = [
+        "d", "wm_yr_wk", "wday", "month",
+        "day_of_month", "day_of_year",
+        "is_event", f"snap_{state}",
+    ]
+    df = daily.merge(calendar[cal_cols], on="d", how="left")
+    df.rename(columns={f"snap_{state}": "snap"}, inplace=True)
+
+    for col in ["wday", "month", "day_of_month", "day_of_year"]:
+        df[col] = df[col].ffill().bfill()
+    df["is_event"] = df["is_event"].fillna(0.0).astype(np.float32)
+    df["snap"] = df["snap"].fillna(0.0).astype(np.float32)
+
+    item_prices = (
+        prices[(prices["store_id"] == store_id) & (prices["item_id"] == item_id)]
+        [["wm_yr_wk", "sell_price"]]
+        .rename(columns={"sell_price": "avg_price"})
+    )
+    df = df.merge(item_prices, on="wm_yr_wk", how="left")
+    df["avg_price"] = df["avg_price"].ffill().bfill().fillna(df["avg_price"].median()).astype(np.float32)
+
+    _add_cyclical(df, "wday", 7)
+    _add_cyclical(df, "day_of_month", 31)
+    _add_cyclical(df, "month", 12)
+    _add_cyclical(df, "day_of_year", 365)
+
+    n_samples = len(df) - LOOKBACK
+    train_end_idx = int(0.8 * n_samples) + LOOKBACK
+
+    sales_scaler = StandardScaler()
+    price_scaler = StandardScaler()
+
+    sales_all = df[["sales"]].values.astype(np.float32)
+    price_all = df[["avg_price"]].values.astype(np.float32)
+
+    sales_norm = np.empty(len(df), dtype=np.float32)
+    price_norm = np.empty(len(df), dtype=np.float32)
+    sales_norm[:train_end_idx] = sales_scaler.fit_transform(sales_all[:train_end_idx]).flatten()
+    sales_norm[train_end_idx:] = sales_scaler.transform(sales_all[train_end_idx:]).flatten()
+    price_norm[:train_end_idx] = price_scaler.fit_transform(price_all[:train_end_idx]).flatten()
+    price_norm[train_end_idx:] = price_scaler.transform(price_all[train_end_idx:]).flatten()
+
+    df["sales_norm"] = sales_norm
+    df["price_norm"] = price_norm
+
+    feature_cols = [
+        "sin_wday", "cos_wday",
+        "sin_day_of_month", "cos_day_of_month",
+        "sin_month", "cos_month",
+        "sin_day_of_year", "cos_day_of_year",
+        "snap", "is_event",
+        "price_norm",
+        "sales_norm",
+    ]
+
+    data = df[feature_cols].values.astype(np.float32)
+    targets = df["sales_norm"].values.astype(np.float32)
+
+    X_list, y_list = [], []
+    for i in range(LOOKBACK, len(data)):
+        X_list.append(data[i - LOOKBACK:i].flatten())
+        y_list.append(targets[i])
+
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.float32)
+
+    split = int(0.8 * len(X))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    if return_scaler:
+        return X_train, y_train, X_test, y_test, sales_scaler
+    return X_train, y_train, X_test, y_test
+
+
 def load_data_torch(partition_id: int, num_partitions: int = 10):
     """
     Wrapper que chama load_data() e empacota os arrays em DataLoaders PyTorch.

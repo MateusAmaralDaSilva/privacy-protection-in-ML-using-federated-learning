@@ -11,7 +11,7 @@ from flwr.server.strategy import FedAvg
 from flwr.simulation import run_simulation
 
 from croston_model import CrostonForecaster
-from dataset import load_timeseries
+from dataset import load_timeseries, load_timeseries_item, STORE_IDS
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -24,6 +24,10 @@ CROSTON_ALPHA = 0.1
 CROSTON_BETA = 0.1
 CROSTON_VARIANT = "sba"
 
+# Defina ITEM_ID para treinar federado em um único produto (cada cliente = mesma
+# SKU numa loja diferente). None usa o comportamento padrão (soma da loja inteira).
+ITEM_ID: str | None = None  # ex: "FOODS_3_090"
+
 # ---------------------------------------------------------------------------
 # Estratégia: Ensemble Federado sem Agregação de Parâmetros
 #
@@ -32,7 +36,7 @@ CROSTON_VARIANT = "sba"
 #   daquele cliente. Fazer FedAvg entre lojas destrói a interpretação local.
 #   Aqui o servidor NUNCA envia estado para guiar o treino. Cada cliente
 #   treina do zero (cold start) a cada rodada, preservando a validade
-#   estatística dos seus estimadores.
+#   estatística dos seus estimadores.1
 #
 # Fluxo por rodada:
 #   Fit:      servidor → parâmetros vazios → cliente treina independentemente
@@ -188,10 +192,10 @@ class FlowerCrostonEnsembleClient(NumPyClient):
 
 def client_fn(context: Context):
     partition_id = context.node_config["partition-id"]
-    y_train, y_test = load_timeseries(
-        partition_id=partition_id,
-        num_partitions=NUM_PARTITIONS,
-    )
+    if ITEM_ID is not None:
+        y_train, y_test = load_timeseries_item(ITEM_ID, STORE_IDS[partition_id])
+    else:
+        y_train, y_test = load_timeseries(partition_id=partition_id, num_partitions=NUM_PARTITIONS)
     return FlowerCrostonEnsembleClient(y_train, y_test).to_client()
 
 
